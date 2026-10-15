@@ -1,0 +1,18 @@
+# systemd-сервис: бот стартует с сервером и перезапускается при сбоях.
+#   sudo cp deploy/vn-news-bot.service /etc/systemd/system/
+#   (поправь пути и пользователя ниже)
+#   sudo systemctl daemon-reload && sudo systemctl enable --now vn-news-bot
+#   журнал: journalctl -u vn-news-bot -f
+[Unit]
+Description=Vietnam news -> Telegram bot
+After=network-online.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/home/ubuntu/vn-news-bot
+ExecStart=/home/ubuntu/vn-news-bot/.venv/bin/python -m bot.main
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

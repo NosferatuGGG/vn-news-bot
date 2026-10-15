@@ -1,0 +1,75 @@
+# Запуск бота по расписанию на серверах GitHub.
+# Память бота (news.db) хранится в отдельной ветке «state» и подтягивается при каждом запуске.
+name: news-bot
+
+on:
+  schedule:
+    - cron: "*/20 * * * *"     # каждые 20 минут (время UTC, для частоты это не важно)
+  workflow_dispatch:            # кнопка «Run workflow» для ручного запуска
+
+permissions:
+  contents: write               # чтобы сохранять память бота в ветку state
+
+concurrency:
+  group: news-bot               # два запуска одновременно не пойдут
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Установка библиотек
+        run: pip install -r requirements.txt
+
+      - name: Достаём память бота
+        run: |
+          git fetch --depth=1 origin state 2>/dev/null \
+            && git show origin/state:news.db > news.db \
+            && echo "Память загружена" \
+            || echo "Первый запуск — память пустая"
+
+      - name: Запуск бота
+        env:
+          # секреты (Settings → Secrets and variables → Actions → Secrets)
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
+          TELEGRAM_ADMIN_CHAT_ID: ${{ secrets.TELEGRAM_ADMIN_CHAT_ID }}
+          # настройки (там же → вкладка Variables); не задано — значение по умолчанию
+          LLM_PROVIDER: ${{ vars.LLM_PROVIDER }}
+          MODEL_FAST: ${{ vars.MODEL_FAST }}
+          MODEL_WRITER: ${{ vars.MODEL_WRITER }}
+          MODE: ${{ vars.MODE }}
+          MIN_SCORE: ${{ vars.MIN_SCORE }}
+          MAX_POSTS_PER_DAY: ${{ vars.MAX_POSTS_PER_DAY }}
+          MIN_GAP_MIN: ${{ vars.MIN_GAP_MIN }}
+          QUIET_FROM: ${{ vars.QUIET_FROM }}
+          QUIET_TO: ${{ vars.QUIET_TO }}
+          CHANNEL_SIGNATURE: ${{ vars.CHANNEL_SIGNATURE }}
+          RATES: ${{ vars.RATES }}
+          DRY_RUN: ${{ vars.DRY_RUN }}
+          # за один запуск — не больше 10 новостей через нейросеть, чтобы уложиться в бесплатные лимиты
+          MAX_LLM_ITEMS_PER_SCAN: ${{ vars.MAX_LLM_ITEMS_PER_SCAN || '10' }}
+        run: python -m bot.main --once
+
+      - name: Сохраняем память бота
+        # в тестовом режиме (DRY_RUN=1) память не сохраняем: после него бот начнёт с чистого листа
+        if: always() && vars.DRY_RUN != '1'
+        run: |
+          [ -f news.db ] || exit 0
+          mkdir -p /tmp/state && cp news.db /tmp/state/
+          cd /tmp/state
+          git init -q -b state
+          git add news.db
+          git -c user.name="news-bot" -c user.email="news-bot@users.noreply.github.com" commit -qm "state $(date -u +%F_%H:%M)"
+          git push -qf "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" state
