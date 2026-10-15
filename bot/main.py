@@ -152,7 +152,7 @@ def send_briefs(store: Store, tg: Telegram | None, deadline: float | None):
         msg_id, kind = 0, "text"
         if tg and CFG.admin_chat_id:
             msg_id, kind = tg.send_card(CFG.admin_chat_id, card, art.image, card_buttons(row["id"], "sent"),
-                                        silent=row["score"] < CFG.loud_score)
+                                        silent=row["score"] < CFG.loud_score or is_quiet_time())
         # статус меняем только после успешной отправки — иначе карточка потеряется
         store.update(row["id"], status="sent", post_html=card, image=art.image, tg_message_id=msg_id,
                      card_kind=kind, title_ru=data["headline"])
@@ -190,12 +190,16 @@ def process(store: Store, tg: Telegram | None, deadline: float | None = None) ->
 
 
 # ---------- 5. Публикация по расписанию ----------
+def is_quiet_time() -> bool:
+    """Ночь по Вьетнаму: карточки приходят без звука."""
+    h = datetime.now(ZoneInfo(CFG.timezone)).hour
+    return (h >= CFG.quiet_from or h < CFG.quiet_to) if CFG.quiet_from > CFG.quiet_to \
+        else (CFG.quiet_from <= h < CFG.quiet_to)
+
+
 def can_post_now(store: Store) -> bool:
     now = datetime.now(ZoneInfo(CFG.timezone))
-    h = now.hour
-    quiet = (h >= CFG.quiet_from or h < CFG.quiet_to) if CFG.quiet_from > CFG.quiet_to \
-        else (CFG.quiet_from <= h < CFG.quiet_to)
-    if quiet:
+    if is_quiet_time():
         return False
     if time.time() - store.last_post_time() < CFG.min_gap_min * 60:
         return False
