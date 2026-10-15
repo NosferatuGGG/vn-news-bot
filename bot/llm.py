@@ -59,8 +59,8 @@ def _extract_json(text: str) -> dict:
         return json.loads(m.group(0))
 
 
-def _post_with_retry(url: str, headers: dict, body: dict) -> dict:
-    for attempt in range(5):
+def _post_with_retry(url: str, headers: dict, body: dict, attempts: int = 5) -> dict:
+    for attempt in range(attempts):
         _throttle()
         r = _http.post(url, headers=headers, json=body)
         if r.status_code in (429, 500, 502, 503, 529):
@@ -71,7 +71,7 @@ def _post_with_retry(url: str, headers: dict, body: dict) -> dict:
         if r.status_code >= 400:
             raise LLMError(f"{r.status_code}: {r.text[:500]}")
         return r.json()
-    raise LLMError("Нейросеть недоступна после 5 попыток (лимит бесплатного тарифа?)")
+    raise LLMError(f"{r.status_code} после {attempts} попыток: {r.text[:400]}")
 
 
 def _call_openai_compat(model: str, system: str, user: str, name: str, schema: dict, max_tokens: int) -> dict:
@@ -125,48 +125,58 @@ def _gemini_generate_text(data: dict) -> str:
     return "".join(p.get("text", "") for p in parts if not p.get("thought"))
 
 
+GEMINI_COMPAT_URL = GEMINI_BASE + "/openai/chat/completions"
+_gemini_route = None  # способ, который сработал последним, — с него и начинаем
+
+
 def _call_gemini(model: str, system: str, user: str, name: str, schema: dict, max_tokens: int) -> dict:
-    headers = {"x-goog-api-key": CFG.llm_api_key}
+    """Пробуем по очереди все способы, которыми Google принимает запросы, — какой-нибудь да сработает.
+    Первым идёт тот, что уже сработал в этом запуске."""
+    global _gemini_route
+    key = CFG.llm_api_key
     instruction = system + "\n\nОтвет — только JSON-объект по схеме, без пояснений."
     with_schema_text = instruction + "\nСхема: " + json.dumps(schema, ensure_ascii=False)
-    attempts = [
-        ("interactions", f"{GEMINI_BASE}/interactions", {
-            "model": model,
-            "input": user,
-            "system_instruction": instruction,
-            "generation_config": {"max_output_tokens": max_tokens},
-            "response_format": {"type": "text", "mime_type": "application/json", "schema": schema},
-            "store": False,
+    routes = {
+        "compat": (GEMINI_COMPAT_URL, {"Authorization": f"Bearer {key}"}, {
+            "model": model, "max_tokens": max_tokens,
+            "messages": [{"role": "system", "content": with_schema_text}, {"role": "user", "content": user}],
+            "response_format": {"type": "json_object"},
         }),
-        ("generate", f"{GEMINI_BASE}/models/{model}:generateContent", {
-            "systemInstruction": {"parts": [{"text": instruction}]},
-            "contents": [{"role": "user", "parts": [{"text": user}]}],
-            "generationConfig": {"maxOutputTokens": max_tokens, "responseMimeType": "application/json",
-                                 "responseJsonSchema": schema},
-        }),
-        ("generate", f"{GEMINI_BASE}/models/{model}:generateContent", {
+        "generate": (f"{GEMINI_BASE}/models/{model}:generateContent", {"x-goog-api-key": key}, {
             "systemInstruction": {"parts": [{"text": with_schema_text}]},
             "contents": [{"role": "user", "parts": [{"text": user}]}],
             "generationConfig": {"maxOutputTokens": max_tokens, "responseMimeType": "application/json"},
         }),
-    ]
-    last_error = None
-    for kind, url, body in attempts:
+        "interactions": (f"{GEMINI_BASE}/interactions", {"x-goog-api-key": key}, {
+            "model": model, "input": user, "system_instruction": with_schema_text,
+            "generation_config": {"max_output_tokens": max_tokens}, "store": False,
+        }),
+    }
+    order = ["compat", "generate", "interactions"]
+    if _gemini_route in order:
+        order.remove(_gemini_route)
+        order.insert(0, _gemini_route)
+    errors = []
+    for route in order:
+        url, headers, body = routes[route]
         try:
-            data = _post_with_retry(url, headers, body)
-        except LLMError as e:
-            msg = str(e)
-            key_problem = "API key" in msg or "API_KEY" in msg or "UNAUTHENTICATED" in msg
-            if key_problem or not msg.startswith(("400", "404")):
-                raise
-            log.info("Gemini %s не подошёл (%s), пробую другой способ", kind, msg[:120])
-            last_error = e
+            data = _post_with_retry(url, headers, body, attempts=3)
+            if route == "compat":
+                text = (data.get("choices") or [{}])[0].get("message", {}).get("content") or ""
+            elif route == "generate":
+                text = _gemini_generate_text(data)
+            else:
+                text = _gemini_interactions_text(data)
+            result = _extract_json(text)
+        except (LLMError, ValueError, KeyError, IndexError, TypeError) as e:
+            errors.append(f"{route}: {str(e)[:300]}")
+            log.warning("Gemini, способ %s не сработал: %s", route, str(e)[:300])
             continue
-        text = _gemini_interactions_text(data) if kind == "interactions" else _gemini_generate_text(data)
-        if text.strip():
-            return _extract_json(text)
-        last_error = LLMError(f"Gemini вернул пустой ответ ({kind})")
-    raise last_error or LLMError("Gemini не ответил")
+        if _gemini_route != route:
+            log.info("Gemini отвечает через способ %s", route)
+            _gemini_route = route
+        return result
+    raise LLMError("Gemini не ответил ни одним способом. " + " | ".join(errors))
 
 
 def _call_anthropic(model: str, system: str, user: str, name: str, schema: dict, max_tokens: int) -> dict:

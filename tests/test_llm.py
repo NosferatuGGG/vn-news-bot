@@ -15,6 +15,7 @@ def _mock(monkeypatch, handler, provider):
     monkeypatch.setattr(CFG, "llm_min_interval_sec", 0)
     monkeypatch.setattr(llm, "_http", httpx.Client(transport=httpx.MockTransport(handler)))
     monkeypatch.setattr(llm.time, "sleep", lambda s: None)
+    monkeypatch.setattr(llm, "_gemini_route", None)
 
 
 def _gemini_ok(payload, thought=True):
@@ -33,60 +34,65 @@ def _interactions_ok(payload):
     ]})
 
 
-def test_gemini_interactions_with_new_aq_key(monkeypatch):
+def _compat_ok(payload):
+    return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(payload)}}]})
+
+
+def test_gemini_compat_first_with_aq_key(monkeypatch):
     seen = []
 
     def handler(req):
         seen.append(req)
-        return _interactions_ok(SCORE)
+        return _compat_ok(SCORE)
 
     _mock(monkeypatch, handler, "gemini")
     monkeypatch.setattr(CFG, "llm_api_key", "AQ.Ab8-new-style-key")
     res = llm.score("t", "s", "text", "src", [])
-    req = seen[0]
-    body = json.loads(req.content)
-    assert str(req.url).endswith("/v1beta/interactions")
-    assert req.headers["x-goog-api-key"] == "AQ.Ab8-new-style-key"
-    assert "authorization" not in req.headers  # ключ отправляется ровно один раз
-    assert body["model"] == CFG.model_fast and body["store"] is False
-    assert body["response_format"]["schema"]["required"][0] == "score"
-    assert res["score"] == 10  # 12 обрезано до 10; ввод и размышления не перепутаны с ответом
+    assert str(seen[0].url).endswith("/v1beta/openai/chat/completions")
+    assert seen[0].headers["authorization"] == "Bearer AQ.Ab8-new-style-key"
+    assert res["score"] == 10  # 12 обрезано до 10
 
 
-def test_gemini_falls_back_to_generate_content(monkeypatch):
+def test_gemini_switches_route_and_remembers_it(monkeypatch):
     calls = []
 
     def handler(req):
         url = str(req.url)
-        body = json.loads(req.content)
-        if url.endswith("/interactions"):
-            calls.append("interactions")
-            return httpx.Response(404, json={"error": {"message": "Not found"}})
-        if "responseJsonSchema" in body["generationConfig"]:
-            calls.append("generate+schema")
-            return httpx.Response(400, json={"error": {"message": "Unknown name responseJsonSchema"}})
-        calls.append("generate")
-        return _gemini_ok(SCORE)
+        if "/openai/" in url:
+            calls.append("compat")
+            return httpx.Response(401, json={"error": {"message": "ACCESS_TOKEN_TYPE_UNSUPPORTED"}})
+        if url.endswith(":generateContent"):
+            calls.append("generate")
+            assert req.headers["x-goog-api-key"]
+            return _gemini_ok(SCORE)
+        calls.append("interactions")
+        return _interactions_ok(SCORE)
 
     _mock(monkeypatch, handler, "gemini")
     assert llm.score("t", "s", "x", "src", [])["category"] == "crime"
-    assert calls == ["interactions", "generate+schema", "generate"]
+    assert llm.score("t", "s", "x", "src", [])["category"] == "crime"
+    assert calls == ["compat", "generate", "generate"]  # второй раз сразу рабочим способом
 
 
-def test_gemini_bad_key_stops_immediately(monkeypatch):
-    calls = []
-
+def test_gemini_interactions_as_last_resort(monkeypatch):
     def handler(req):
-        calls.append(1)
-        return httpx.Response(400, json={"error": {"message": "API key not valid", "status": "INVALID_ARGUMENT"}})
+        url = str(req.url)
+        if url.endswith("/interactions"):
+            return _interactions_ok(SCORE)
+        return httpx.Response(429, json={"error": {"message": "quota exceeded, limit: 0"}})
 
     _mock(monkeypatch, handler, "gemini")
+    assert llm.score("t", "s", "x", "src", [])["score"] == 10
+
+
+def test_gemini_all_routes_fail_with_readable_reason(monkeypatch):
+    _mock(monkeypatch, lambda req: httpx.Response(400, json={"error": {"message": "API key not valid"}}), "gemini")
     try:
         llm.score("t", "s", "x", "src", [])
-        raise AssertionError("ожидалась ошибка ключа")
+        raise AssertionError("ожидалась ошибка")
     except llm.LLMError as e:
-        assert "API key" in str(e)
-    assert len(calls) == 1
+        msg = str(e)
+        assert "compat:" in msg and "generate:" in msg and "interactions:" in msg and "API key" in msg
 
 
 def test_fallback_to_json_object_on_400_and_retry_on_429(monkeypatch):
@@ -123,7 +129,7 @@ def test_incomplete_answer_is_retried(monkeypatch):
     answers = iter([{"ok": True}, {"ok": False, "problems": ["цифра"]}])
 
     def handler(req):
-        return _interactions_ok(next(answers))
+        return _compat_ok(next(answers))
 
     _mock(monkeypatch, handler, "gemini")
     assert llm.fact_check("пост", "статья")["problems"] == ["цифра"]
