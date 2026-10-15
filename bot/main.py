@@ -7,6 +7,7 @@
 """
 import argparse
 import html
+import json
 import logging
 import time
 from datetime import datetime
@@ -50,83 +51,140 @@ def make_post(title: str, text: str, source: str, url: str) -> tuple[str, list[s
     return build_post(data, url, source), ([] if check["ok"] else check["problems"])
 
 
-def process(store: Store, tg: Telegram | None, deadline: float | None = None) -> bool:
-    """Возвращает False, если нейросеть или Telegram не ответили (новости дождутся следующего запуска)."""
-    # предфильтр по ключевым словам — бесплатно; ждущие разбора тоже перепроверяем,
-    # чтобы правки фильтра сразу действовали и на очередь
+def _load_quota_state(store: Store):
+    llm.EXHAUSTED.clear()
+    raw = store.kv_get("llm_exhausted", "")
+    if raw:
+        try:
+            llm.EXHAUSTED.update(json.loads(raw))
+        except ValueError:
+            pass
+
+
+def _save_quota_state(store: Store, tg: Telegram | None):
+    store.kv_set("llm_exhausted", json.dumps(llm.EXHAUSTED))
+    today = llm.quota_day()
+    models = {CFG.model_fast, CFG.model_writer}
+    if all(llm.EXHAUSTED.get(m) == today for m in models) and store.kv_get("quota_notice") != today:
+        store.kv_set("quota_notice", today)
+        log.warning("Бесплатный лимит нейросети на сегодня исчерпан")
+        if tg and CFG.admin_chat_id and not CFG.dry_run:
+            try:
+                tg.call_text(CFG.admin_chat_id,
+                             "ℹ️ Бесплатный лимит нейросети на сегодня закончился. "
+                             "Новые черновики появятся после 14:00 по Вьетнаму, когда Google обнулит лимит. "
+                             "Кнопки под уже присланными черновиками работают как обычно.")
+            except Exception as err:  # noqa: BLE001
+                log.warning("Не смог сообщить о лимите: %s", err)
+
+
+def prefilter_queue(store: Store):
+    """Предфильтр по ключевым словам — бесплатно; ждущие разбора тоже перепроверяем,
+    чтобы правки фильтра сразу действовали и на очередь."""
     cutoff = time.time() - CFG.max_age_hours * 3600
     for row in list(store.by_status("new", limit=2000)) + list(store.by_status("candidate", limit=2000)):
         ok, why = prefilter(row["title"], row["summary"] or "")
         if ok and row["published_at"] < cutoff:
             ok, why = False, "old"
         store.update(row["id"], status="candidate" if ok else "filtered", note=why)
+    for row in store.by_status("scored", limit=1000):
+        if row["published_at"] < cutoff:
+            store.update(row["id"], status="skipped", note="устарела, пока ждала очереди")
 
-    # сначала про иностранцев и визы, потом криминал в «наших» городах, потом остальное; внутри — свежие
+
+def score_candidates(store: Store):
+    """Шаг 1: оценить пачку новостей ОДНИМ запросом к нейросети (по заголовкам и анонсам)."""
     order = ("CASE note WHEN 'strong' THEN 0 WHEN 'local' THEN 1 WHEN 'crime' THEN 2 ELSE 3 END, "
              "published_at DESC")
-    queue = store.by_status("candidate", limit=CFG.max_llm_items_per_scan, order=order)
-    log.info("К нейросети: %d из %d подходящих новостей", len(queue),
+    batch = store.by_status("candidate", limit=CFG.score_batch_size, order=order)
+    if not batch:
+        return
+    log.info("Оцениваю %d новостей одним запросом (ждут оценки: %d)", len(batch),
              len(store.by_status("candidate", limit=5000)))
-    for row in queue:
+    items = [{"id": r["id"], "source": r["source"], "title": r["title"], "summary": r["summary"] or ""} for r in batch]
+    scores = llm.score_batch(items, store.recent_posted())
+    for row in batch:
+        sc = scores.get(row["id"])
+        if not sc:
+            continue  # модель пропустила — оценим в следующий раз
+        fields = dict(score=sc["score"], category=sc.get("category", "other"), title_ru=sc.get("title_ru", ""),
+                      note=str(sc.get("reason", ""))[:300])
+        if sc["duplicate_of"] and sc["duplicate_of"] != row["id"]:
+            log.info("  [дубль] %s", fields["title_ru"])
+            store.update(row["id"], status="duplicate", **fields)
+        elif sc["score"] < CFG.min_score:
+            log.info("  [%s/10 — мимо] %s", sc["score"], fields["title_ru"])
+            store.update(row["id"], status="low", **fields)
+        else:
+            log.info("  [%s/10 — в работу] %s", sc["score"], fields["title_ru"])
+            store.update(row["id"], status="scored", **fields)
+
+
+def write_drafts(store: Store, tg: Telegram | None, deadline: float | None):
+    """Шаг 2: самые интересные из оценённых — прочитать целиком, переписать, проверить, прислать."""
+    todo = store.by_status("scored", limit=CFG.max_writes_per_run, order="score DESC, published_at DESC")
+    for row in todo:
         if deadline and time.time() > deadline:
-            log.info("Время запуска вышло — остальные новости разберу в следующий раз")
-            break
+            log.info("Время запуска вышло — остальное в следующий раз")
+            return
         check_buttons(store, tg)   # нажатия, сделанные пока идёт разбор, срабатывают сразу
-        item_started = time.time()
+        started = time.time()
         try:
             art = fetch_article(row["url"])
-            if art.published_at:
-                store.update(row["id"], published_at=art.published_at)
-            if art.published_at and art.published_at < time.time() - CFG.max_age_hours * 3600:
+        except Exception as err:  # noqa: BLE001
+            log.warning("Не открылась статья %s: %s", row["url"], err)
+            store.update(row["id"], status="error", note=str(err)[:300])
+            continue
+        if art.published_at:
+            store.update(row["id"], published_at=art.published_at)
+            if art.published_at < time.time() - CFG.max_age_hours * 3600:
                 store.update(row["id"], status="filtered", note="old")
                 continue
-            if len(art.text) < 200:
-                store.update(row["id"], status="error", note="no text")
-                continue
+        if len(art.text) < 200:
+            store.update(row["id"], status="error", note="no text")
+            continue
+        post, problems = make_post(row["title"], art.text, row["source"], row["url"])
+        log.info("  [%s/10 — ГОТОВ ПОСТ] %s (%.0f с)", row["score"], row["title_ru"], time.time() - started)
+        if problems or CFG.mode == "moderate":
+            # спорное — всегда через человека, даже в авто-режиме
+            if tg and CFG.admin_chat_id:
+                head = f"⭐ {row['score']}/10 · {html.escape(row['category'] or '')}\n"
+                if problems:
+                    head += "⚠️ Фактчек сомневается: " + html.escape("; ".join(problems)[:300]) + "\n"
+                tg.send_post(CFG.admin_chat_id, head + "\n" + post, art.image, buttons=[[
+                    {"text": "✅ В очередь", "callback_data": f"q:{row['id']}"},
+                    {"text": "🚀 Сейчас", "callback_data": f"now:{row['id']}"},
+                    {"text": "❌ Мимо", "callback_data": f"skip:{row['id']}"},
+                ]])
+            # статус меняем только после успешной отправки — иначе черновик потеряется
+            store.update(row["id"], status="review", post_html=post, image=art.image)
+        else:
+            store.update(row["id"], status="queued", post_html=post, image=art.image)
 
-            sc = llm.score(row["title"], row["summary"] or "", art.text, row["source"], store.recent_posted())
-            fields = dict(score=sc["score"], category=sc["category"], title_ru=sc["title_ru"],
-                          image=art.image, note=sc["reason"][:300])
-            if sc.get("duplicate_of"):
-                log.info("  [дубль] %s", sc["title_ru"])
-                store.update(row["id"], status="duplicate", **fields)
-                continue
-            if sc["score"] < CFG.min_score:
-                log.info("  [%s/10 — мимо] %s", sc["score"], sc["title_ru"])
-                store.update(row["id"], status="low", **fields)
-                continue
 
-            post, problems = make_post(row["title"], art.text, row["source"], row["url"])
-            log.info("  [%s/10 — ГОТОВ ПОСТ] %s (%.0f с)", sc["score"], sc["title_ru"], time.time() - item_started)
-
-            if problems or CFG.mode == "moderate":
-                # спорное — всегда через человека, даже в авто-режиме
-                if tg and CFG.admin_chat_id:
-                    head = f"⭐ {sc['score']}/10 · {html.escape(sc['category'])}\n"
-                    if problems:
-                        head += "⚠️ Фактчек сомневается: " + html.escape("; ".join(problems)[:300]) + "\n"
-                    tg.send_post(CFG.admin_chat_id, head + "\n" + post, art.image, buttons=[[
-                        {"text": "✅ В очередь", "callback_data": f"q:{row['id']}"},
-                        {"text": "🚀 Сейчас", "callback_data": f"now:{row['id']}"},
-                        {"text": "❌ Мимо", "callback_data": f"skip:{row['id']}"},
-                    ]])
-                # статус меняем только после успешной отправки — иначе черновик потеряется
-                store.update(row["id"], status="review", post_html=post, **fields)
-            else:
-                store.update(row["id"], status="queued", post_html=post, **fields)
-        except llm.LLMError as err:
-            # лимит или сбой нейросети: новость остаётся в очереди на разбор до следующего запуска
-            log.error("Нейросеть недоступна: %s", err)
-            print(f"::error title=Нейросеть::{str(err)[:900]}", flush=True)
-            return False
-        except TelegramError as err:
-            log.error("Telegram не принял черновик: %s", err)
-            print(f"::error title=Telegram::{str(err)[:900]}", flush=True)
-            return False
-        except Exception as err:  # noqa: BLE001
-            log.exception("Ошибка на %s", row["url"])
-            store.update(row["id"], status="error", note=str(err)[:300])
-    return True
+def process(store: Store, tg: Telegram | None, deadline: float | None = None) -> bool:
+    """Возвращает False только при настоящем сбое (не при дневном лимите — он обнуляется сам)."""
+    prefilter_queue(store)
+    _load_quota_state(store)
+    llm.DEADLINE = deadline
+    try:
+        score_candidates(store)
+        write_drafts(store, tg, deadline)
+        return True
+    except llm.LLMQuotaError as err:
+        log.info("Нейросеть на паузе: %s. Продолжу в следующий запуск.", err)
+        return True
+    except llm.LLMError as err:
+        log.error("Нейросеть не ответила: %s", err)
+        print(f"::error title=Нейросеть::{str(err)[:900]}", flush=True)
+        return False
+    except TelegramError as err:
+        log.error("Telegram не принял черновик: %s", err)
+        print(f"::error title=Telegram::{str(err)[:900]}", flush=True)
+        return False
+    finally:
+        llm.DEADLINE = None
+        _save_quota_state(store, tg)
 
 
 # ---------- 5. Публикация по расписанию ----------
@@ -166,36 +224,54 @@ def publish_from_queue(store: Store, tg: Telegram):
 def handle_updates(store: Store, tg: Telegram, timeout: int):
     offset = int(store.kv_get("tg_offset", 0))
     for upd in tg.get_updates(offset, timeout):
-        store.kv_set("tg_offset", upd["update_id"] + 1)
-        cb = upd.get("callback_query")
-        if not cb or ":" not in cb.get("data", ""):
-            continue
-        if str(cb["from"]["id"]) != str(CFG.admin_chat_id) and str(cb["message"]["chat"]["id"]) != str(CFG.admin_chat_id):
-            continue
-        action, item_id = cb["data"].split(":", 1)
-        row = store.get(int(item_id)) if item_id.isdigit() else None
-        if not row:
-            continue
-        msg = cb["message"]
+        try:
+            _handle_one(store, tg, upd)
+        finally:
+            # отмечаем нажатие обработанным только после попытки его выполнить
+            store.kv_set("tg_offset", upd["update_id"] + 1)
+
+
+def _handle_one(store: Store, tg: Telegram, upd: dict):
+    cb = upd.get("callback_query")
+    if not cb or ":" not in cb.get("data", ""):
+        return
+    if str(cb["from"]["id"]) != str(CFG.admin_chat_id) and str(cb["message"]["chat"]["id"]) != str(CFG.admin_chat_id):
+        return
+    action, item_id = cb["data"].split(":", 1)
+    row = store.get(int(item_id)) if item_id.isdigit() else None
+    msg = cb["message"]
+    if not row:
+        return
+    try:
         if action == "q":
             store.update(row["id"], status="queued")
             label, toast = "✅ В очереди", "В очереди"
         elif action == "now":
-            publish(store, tg, row["id"])
+            if row["status"] != "posted":
+                publish(store, tg, row["id"])
             label, toast = "🚀 Опубликовано", "Опубликовано"
         elif action == "skip":
             store.update(row["id"], status="skipped")
             label, toast = "❌ Пропущено", "Пропущено"
         else:
-            continue
-        # при запуске по расписанию нажатие обрабатывается позже — Telegram может
-        # уже не принять ответ на кнопку; само действие при этом выполнено
-        for call in (lambda: tg.answer_callback(cb["id"], toast),
-                     lambda: tg.edit_buttons(msg["chat"]["id"], msg["message_id"], label)):
-            try:
-                call()
-            except Exception as err:  # noqa: BLE001
-                log.info("Telegram не принял ответ на кнопку: %s", err)
+            return
+    except Exception as err:  # noqa: BLE001
+        log.error("Не смог выполнить кнопку %s для %s: %s", action, row["id"], err)
+        print(f"::error title=Кнопка::{str(err)[:500]}", flush=True)
+        try:
+            tg.call_text(CFG.admin_chat_id, f"⚠️ Не получилось опубликовать «{row['title_ru']}»: {str(err)[:300]}")
+        except Exception:  # noqa: BLE001
+            pass
+        return
+    log.info("Кнопка «%s»: %s", toast, row["title_ru"])
+    # при запуске по расписанию нажатие обрабатывается позже — Telegram может
+    # уже не принять ответ на кнопку; само действие при этом выполнено
+    for call in (lambda: tg.answer_callback(cb["id"], toast),
+                 lambda: tg.edit_buttons(msg["chat"]["id"], msg["message_id"], label)):
+        try:
+            call()
+        except Exception as err:  # noqa: BLE001
+            log.info("Telegram не принял ответ на кнопку: %s", err)
 
 
 # ---------- Точки входа ----------

@@ -133,3 +133,64 @@ def test_incomplete_answer_is_retried(monkeypatch):
 
     _mock(monkeypatch, handler, "gemini")
     assert llm.fact_check("пост", "статья")["problems"] == ["цифра"]
+
+
+def test_daily_quota_switches_to_backup_model_without_retries(monkeypatch):
+    calls = []
+
+    def handler(req):
+        body = json.loads(req.content)
+        model = body.get("model", "")
+        calls.append(model)
+        if model == CFG.model_writer:
+            return httpx.Response(429, json=[{"error": {"code": 429, "message": "You exceeded your current quota",
+                                                        "details": [{"quotaId": "GenerateRequestsPerDayPerProjectPerModel-FreeTier"}]}}])
+        return _compat_ok({"emoji": "🚨", "headline": "З", "body": "Т", "takeaway": "", "hashtags": []})
+
+    _mock(monkeypatch, handler, "gemini")
+    monkeypatch.setattr(llm, "EXHAUSTED", {})
+    assert llm.write_post("t", "text", "src", "url")["headline"] == "З"
+    assert calls == [CFG.model_writer, CFG.model_fast]          # без повторов и без перебора способов
+    assert llm.EXHAUSTED[CFG.model_writer] == llm.quota_day()
+    calls.clear()
+    llm.write_post("t", "text", "src", "url")
+    assert calls == [CFG.model_fast]                            # исчерпанную модель больше не трогаем
+
+
+def test_per_minute_limit_waits_and_retries(monkeypatch):
+    calls = []
+
+    def handler(req):
+        calls.append(1)
+        if len(calls) == 1:
+            return httpx.Response(429, json=[{"error": {"message": "quota", "details": [
+                {"quotaId": "GenerateRequestsPerMinutePerProjectPerModel-FreeTier"}, {"retryDelay": "12s"}]}}])
+        return _compat_ok(SCORE)
+
+    _mock(monkeypatch, handler, "gemini")
+    monkeypatch.setattr(llm, "EXHAUSTED", {})
+    assert llm.score("t", "s", "x", "src", [])["score"] == 10 and len(calls) == 2
+
+
+def test_deadline_stops_waiting(monkeypatch):
+    _mock(monkeypatch, lambda req: httpx.Response(503, json={}), "gemini")
+    monkeypatch.setattr(llm, "EXHAUSTED", {})
+    monkeypatch.setattr(llm, "DEADLINE", llm.time.time() + 1)
+    try:
+        llm.score("t", "s", "x", "src", [])
+        raise AssertionError("ожидалась остановка по времени")
+    except llm.LLMQuotaError as e:
+        assert "время" in str(e)
+    finally:
+        monkeypatch.setattr(llm, "DEADLINE", None)
+
+
+def test_batch_scoring_parses_every_item(monkeypatch):
+    payload = {"items": [
+        {"id": 5, "score": 11, "category": "crime", "title_ru": "А", "duplicate_of": 0, "reason": "r"},
+        {"id": 6, "score": 2, "category": "other", "title_ru": "Б", "duplicate_of": "5", "reason": "r"},
+    ]}
+    _mock(monkeypatch, lambda req: _compat_ok(payload), "gemini")
+    monkeypatch.setattr(llm, "EXHAUSTED", {})
+    res = llm.score_batch([{"id": 5, "source": "s", "title": "x"}, {"id": 6, "source": "s", "title": "y"}], [])
+    assert res[5]["score"] == 10 and res[6]["duplicate_of"] == 5

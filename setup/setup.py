@@ -463,6 +463,9 @@ def main():
     channel = step_channel(bot)
     provider, secret_name, key = step_ai()
     repo = step_deploy(user, bot, owner_id, channel, provider, secret_name, key)
+    # бот должен получать только нажатия кнопок: без этого Telegram отбрасывает
+    # нажатия, сделанные до первого запуска бота
+    bot.call("getUpdates", offset=-1, timeout=0, allowed_updates=["callback_query"])
 
     say()
     say(f"{G}{B}Готово! Бот работает сам, компьютер можно выключать.{X}")

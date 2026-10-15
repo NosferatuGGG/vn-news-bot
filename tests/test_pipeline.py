@@ -64,22 +64,33 @@ def test_full_pipeline(tmp_path, monkeypatch):
         Entry("https://tn.vn/phu-quoc", "Phá đường dây giả mạo khách sạn, resort ở Phú Quốc để lừa đảo", "", now, "Thanh Niên"),
         Entry("https://tn.vn/old", "Cướp giật điện thoại du khách", "", now - 5 * 86400, "Thanh Niên"),
         Entry("https://vne.vn/ga", "Ngã ba Trần Phú ùn tắc giờ cao điểm", "", now, "VnExpress"),
+        Entry("https://vne.vn/meh", "Trộm xe đạp ở Hà Nội", "", now, "VnExpress"),
     ]
     monkeypatch.setattr(main, "SOURCES", ["one-source"])
     monkeypatch.setattr(main, "fetch_source", lambda src: entries)
     monkeypatch.setattr(main, "fetch_article", lambda url: Article("Nội dung bài báo " * 40, "https://img/x.jpg", None))
+    monkeypatch.setattr(CFG, "max_writes_per_run", 5)
 
-    scored = []
+    batches = []
 
-    def fake_score(title, summary, text, source, recent):
-        scored.append(title)
-        if "Phá đường dây" in title:  # та же история с другого сайта
-            return {"score": 9, "category": "scam", "title_ru": "Фейковые отели Фукуока", "duplicate_of": recent[0]["id"], "reason": "dup"}
-        if "Phú Quốc" in title:
-            return {"score": 9, "category": "scam", "title_ru": "Фейковые отели Фукуока", "duplicate_of": 0, "reason": "ok"}
-        return {"score": 10, "category": "russians", "title_ru": "У русских туристов вырвали сумку", "duplicate_of": 0, "reason": "ok"}
+    def fake_batch(items, recent):
+        batches.append([it["id"] for it in items])
+        out = {}
+        by_title = {it["title"]: it["id"] for it in items}
+        for it in items:
+            t = it["title"]
+            if "Phá đường dây" in t:
+                out[it["id"]] = {"id": it["id"], "score": 9, "category": "scam", "title_ru": "Фейковые отели (дубль)",
+                                 "duplicate_of": by_title["Giả resort 5 sao ở Phú Quốc để lừa đặt cọc, dòng tiền hơn 6.000 tỷ đồng"], "reason": "dup"}
+            elif "Phú Quốc" in t:
+                out[it["id"]] = {"id": it["id"], "score": 9, "category": "scam", "title_ru": "Фейковые отели Фукуока", "duplicate_of": 0, "reason": "ok"}
+            elif "du khách" in t:
+                out[it["id"]] = {"id": it["id"], "score": 10, "category": "russians", "title_ru": "У туристов вырвали сумку", "duplicate_of": 0, "reason": "ok"}
+            else:
+                out[it["id"]] = {"id": it["id"], "score": 3, "category": "crime", "title_ru": "Кража велосипеда", "duplicate_of": 0, "reason": "скучно"}
+        return out
 
-    monkeypatch.setattr(llm, "score", fake_score)
+    monkeypatch.setattr(llm, "score_batch", fake_batch)
     monkeypatch.setattr(llm, "write_post", lambda *a, **k: {
         "emoji": "🚨", "headline": "Заголовок", "body": "Текст", "takeaway": "Держите сумку", "hashtags": ["#Нячанг"]})
     checks = iter([{"ok": False, "problems": ["лишняя цифра"]}, {"ok": True, "problems": []},
@@ -89,16 +100,17 @@ def test_full_pipeline(tmp_path, monkeypatch):
     store = Store(str(tmp_path / "t.db"))
     tg = Telegram("x")
     main.collect(store)
-    main.process(store, tg)
+    assert main.process(store, tg) is True
 
     statuses = {r["url"]: r["status"] for r in store.db.execute("SELECT url, status FROM items")}
     assert "https://tn.vn/old" not in statuses                       # старьё не берём
     assert statuses["https://bkh.vn/hoi-nghi"] == "filtered"          # скучное отсечено без нейросети
     assert statuses["https://vne.vn/ga"] == "filtered"                # «Ngã ba» ≠ «Nga»
+    assert statuses["https://vne.vn/meh"] == "low"
     assert statuses["https://bkh.vn/giat-tui"] == "queued"
     assert statuses["https://vne.vn/phu-quoc"] == "queued"
     assert statuses["https://tn.vn/phu-quoc"] == "duplicate"          # дубль с другого сайта
-    assert len(scored) == 3
+    assert len(batches) == 1 and len(batches[0]) == 4                 # все оценены ОДНИМ запросом
 
     main.publish_from_queue(store, tg)
     posted = store.by_status("posted")
@@ -147,25 +159,67 @@ def test_prune_keeps_db_small(tmp_path):
 def test_llm_outage_keeps_news_for_next_run(tmp_path, monkeypatch):
     store = Store(str(tmp_path / "t.db"))
     store.add_item("u1", "Báo Khánh Hòa", "Du khách Nga bị giật túi ở Nha Trang", "", time.time())
-    monkeypatch.setattr(main, "fetch_article", lambda url: Article("Nội dung " * 60, "", None))
 
     def down(*a, **k):
-        raise llm.LLMError("429")
+        raise llm.LLMError("500")
 
-    monkeypatch.setattr(llm, "score", down)
+    monkeypatch.setattr(llm, "score_batch", down)
     assert main.process(store, Telegram("x")) is False
     assert store.get(1)["status"] == "candidate"
 
 
-def test_buttons_checked_during_long_run(tmp_path, monkeypatch):
-    """Нажатие «Сейчас», сделанное пока бот разбирает новости, обрабатывается в том же запуске."""
+def test_daily_quota_is_not_a_failure(tmp_path, monkeypatch):
+    """Кончился бесплатный лимит — не ошибка: новости ждут, запуск зелёный, тебе одно сообщение в день."""
     monkeypatch.setattr(CFG, "dry_run", False)
     monkeypatch.setattr(CFG, "admin_chat_id", "42")
     store = Store(str(tmp_path / "t.db"))
+    store.add_item("u1", "Báo Khánh Hòa", "Du khách Nga bị giật túi ở Nha Trang", "", time.time())
+    sent = []
+    tg = Telegram("x")
+    monkeypatch.setattr(tg, "call_text", lambda chat, text: sent.append(text))
+    monkeypatch.setattr(tg, "get_updates", lambda offset, timeout: [])
+
+    def exhausted(*a, **k):
+        for m in (CFG.model_fast, CFG.model_writer):
+            llm.EXHAUSTED[m] = llm.quota_day()
+        raise llm.LLMQuotaError("дневной лимит")
+
+    monkeypatch.setattr(llm, "score_batch", exhausted)
+    assert main.process(store, tg) is True
+    assert main.process(store, tg) is True
+    assert store.get(1)["status"] == "candidate"
+    assert len(sent) == 1 and "лимит" in sent[0]
+
+
+def test_buttons_checked_during_long_run(tmp_path, monkeypatch):
+    """Нажатие «Сейчас», сделанное пока бот пишет черновики, обрабатывается в том же запуске."""
+    monkeypatch.setattr(CFG, "dry_run", False)
+    monkeypatch.setattr(CFG, "admin_chat_id", "42")
+    monkeypatch.setattr(CFG, "max_writes_per_run", 3)
+    store = Store(str(tmp_path / "t.db"))
     for i in range(3):
         store.add_item(f"u{i}", "s", "Du khách Nga bị cướp", "", time.time())
+        store.update(i + 1, status="scored", score=8)
     monkeypatch.setattr(main, "fetch_article", lambda url: Article("x", "", None))  # короткий текст → без нейросети
+    monkeypatch.setattr(llm, "score_batch", lambda items, recent: {})
     calls = []
     monkeypatch.setattr(main, "handle_updates", lambda store, tg, timeout: calls.append(timeout))
     main.process(store, Telegram("x"))
     assert len(calls) == 3
+
+
+def test_failed_publish_keeps_working_and_tells_you(tmp_path, monkeypatch):
+    monkeypatch.setattr(CFG, "admin_chat_id", "42")
+    store = Store(str(tmp_path / "t.db"))
+    store.add_item("u1", "s", "t", "", time.time())
+    store.update(1, status="review", post_html="<b>пост</b>", title_ru="Новость")
+    tg = Telegram("x")
+    upd = [{"update_id": 9, "callback_query": {"id": "c", "data": "now:1", "from": {"id": 42},
+                                               "message": {"chat": {"id": 42}, "message_id": 5}}}]
+    monkeypatch.setattr(tg, "get_updates", lambda offset, timeout: upd)
+    monkeypatch.setattr(tg, "send_post", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("chat not found")))
+    told = []
+    monkeypatch.setattr(tg, "call_text", lambda chat, text: told.append(text))
+    main.handle_updates(store, tg, timeout=0)
+    assert store.get(1)["status"] == "review"
+    assert told and "chat not found" in told[0]

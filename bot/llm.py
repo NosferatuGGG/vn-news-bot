@@ -31,11 +31,17 @@ OPENAI_COMPAT_URLS = {
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
 
 _http = httpx.Client(timeout=120)
-_last_call = 0.0
+_last_call: dict = {}          # модель → время последнего запроса
+DEADLINE: float | None = None  # после этого момента новых запросов не делаем (выставляет main)
+EXHAUSTED: dict = {}           # модель → дата (по Калифорнии), когда кончился дневной лимит
 
 
 class LLMError(RuntimeError):
     pass
+
+
+class LLMQuotaError(LLMError):
+    """Кончился бесплатный лимит модели на сегодня (или время запуска вышло) — повторять бесполезно."""
 
 
 _annotations = 0
@@ -51,13 +57,40 @@ def _annotate(level: str, title: str, text: str):
     print(f"::{level} title={title}::{text}", flush=True)
 
 
-def _throttle():
-    """Бесплатные тарифы ограничивают число запросов в минуту — держим паузу."""
-    global _last_call
-    wait = CFG.llm_min_interval_sec - (time.time() - _last_call)
+def _interval(model: str) -> float:
+    """Пауза между запросами к одной модели. У бесплатного Gemini Flash — 5 запросов в минуту,
+    у Flash-Lite — 15, поэтому паузы разные."""
+    if CFG.llm_provider != "gemini":
+        return CFG.llm_min_interval_sec
+    base = CFG.llm_min_interval_sec
+    return max(base, 5.0) if "lite" in model or "gemma" in model else max(base, 13.0)
+
+
+def _throttle(model: str = ""):
+    wait = _interval(model) - (time.time() - _last_call.get(model, 0.0))
     if wait > 0:
-        time.sleep(wait)
-    _last_call = time.time()
+        _sleep(wait)
+    _last_call[model] = time.time()
+
+
+def _sleep(seconds: float):
+    if DEADLINE and time.time() + seconds > DEADLINE:
+        raise LLMQuotaError("время запуска вышло")
+    time.sleep(seconds)
+
+
+def quota_day() -> str:
+    """Дневные лимиты Google обнуляются в полночь по тихоокеанскому времени."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    return datetime.now(ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d")
+
+
+def _parse_429(text: str) -> tuple[bool, float]:
+    """(дневной ли это лимит, через сколько секунд советуют повторить)."""
+    daily = "PerDay" in text or ("exceeded your current quota" in text and "PerMinute" not in text)
+    m = re.search(r'"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"', text)
+    return daily, float(m.group(1)) if m else 0.0
 
 
 def _extract_json(text: str) -> dict:
@@ -73,20 +106,31 @@ def _extract_json(text: str) -> dict:
         return json.loads(m.group(0))
 
 
-def _post_with_retry(url: str, headers: dict, body: dict, attempts: int = 5) -> dict:
+def _post_with_retry(url: str, headers: dict, body: dict, attempts: int = 5, model: str = "") -> dict:
     for attempt in range(attempts):
-        _throttle()
-        r = _http.post(url, headers=headers, json=body)
+        _throttle(model)
+        try:
+            r = _http.post(url, headers=headers, json=body)
+        except httpx.TimeoutException:
+            log.warning("Нейросеть не ответила вовремя, повторяю")
+            continue
+        if r.status_code == 429 and CFG.llm_provider == "gemini":
+            daily, retry = _parse_429(r.text)
+            if daily:
+                raise LLMQuotaError(f"дневной лимит модели {model} исчерпан")
+            log.warning("Лимит запросов в минуту у %s, жду %.0f с", model, retry or 30)
+            _sleep(min(retry or 30, 60))
+            continue
         if r.status_code in (429, 500, 502, 503, 529):
             delay = float(r.headers.get("retry-after") or 0) or min(60, 5 * 2 ** attempt)
             log.warning("Нейросеть ответила %s, жду %.0f с", r.status_code, delay)
             _annotate("warning", f"Нейросеть {r.status_code}", r.text[:200])
-            time.sleep(delay)
+            _sleep(delay)
             continue
         if r.status_code >= 400:
             raise LLMError(f"{r.status_code}: {r.text[:500]}")
         return r.json()
-    raise LLMError(f"{r.status_code} после {attempts} попыток: {r.text[:400]}")
+    raise LLMError(f"нет ответа после {attempts} попыток")
 
 
 def _call_openai_compat(model: str, system: str, user: str, name: str, schema: dict, max_tokens: int) -> dict:
@@ -104,14 +148,14 @@ def _call_openai_compat(model: str, system: str, user: str, name: str, schema: d
         "response_format": {"type": "json_schema", "json_schema": {"name": name, "schema": schema}},
     }
     try:
-        data = _post_with_retry(url, headers, body)
+        data = _post_with_retry(url, headers, body, model=model)
     except LLMError as e:
-        if not str(e).startswith("400"):
+        if isinstance(e, LLMQuotaError) or not str(e).startswith("400"):
             raise
         # модель не умеет схемы — просим просто JSON и даём схему текстом
         body["response_format"] = {"type": "json_object"}
         body["messages"][0]["content"] += "\nСхема: " + json.dumps(schema, ensure_ascii=False)
-        data = _post_with_retry(url, headers, body)
+        data = _post_with_retry(url, headers, body, model=model)
     content = data["choices"][0]["message"].get("content") or ""
     return _extract_json(content)
 
@@ -175,7 +219,7 @@ def _call_gemini(model: str, system: str, user: str, name: str, schema: dict, ma
     for route in order:
         url, headers, body = routes[route]
         try:
-            data = _post_with_retry(url, headers, body, attempts=3)
+            data = _post_with_retry(url, headers, body, attempts=3, model=model)
             if route == "compat":
                 text = (data.get("choices") or [{}])[0].get("message", {}).get("content") or ""
             elif route == "generate":
@@ -183,6 +227,8 @@ def _call_gemini(model: str, system: str, user: str, name: str, schema: dict, ma
             else:
                 text = _gemini_interactions_text(data)
             result = _extract_json(text)
+        except LLMQuotaError:
+            raise  # лимит общий для всех способов — пробовать другие бессмысленно
         except (LLMError, ValueError, KeyError, IndexError, TypeError) as e:
             errors.append(f"{route}: {str(e)[:300]}")
             log.warning("Gemini, способ %s не сработал: %s", route, str(e)[:300])
@@ -205,7 +251,7 @@ def _call_anthropic(model: str, system: str, user: str, name: str, schema: dict,
         "messages": [{"role": "user", "content": user}],
     }
     headers = {"x-api-key": CFG.llm_api_key, "anthropic-version": "2023-06-01"}
-    data = _post_with_retry("https://api.anthropic.com/v1/messages", headers, body)
+    data = _post_with_retry("https://api.anthropic.com/v1/messages", headers, body, model=model)
     for block in data["content"]:
         if block["type"] == "tool_use":
             return block["input"]
@@ -214,15 +260,31 @@ def _call_anthropic(model: str, system: str, user: str, name: str, schema: dict,
 
 # max_tokens с запасом: у новых моделей «размышления» тоже считаются в ответ,
 # а платишь всё равно только за реально потраченное
-def _call(model: str, system: str, user: str, name: str, schema: dict, max_tokens: int = 3000) -> dict:
+def _call(models, system: str, user: str, name: str, schema: dict, max_tokens: int = 3000) -> dict:
+    """models — одна модель или список запасных: если у первой кончился дневной лимит, берём следующую."""
     fn = {"anthropic": _call_anthropic, "gemini": _call_gemini}.get(CFG.llm_provider, _call_openai_compat)
-    for attempt in range(2):
-        result = fn(model, system, user, name, schema, max_tokens)
-        missing = [k for k in schema["required"] if k not in result]
-        if not missing:
-            return result
-        log.warning("В ответе модели нет полей %s, повторяю", missing)
-    raise LLMError(f"Модель дважды вернула неполный ответ: {result}")
+    chain = [models] if isinstance(models, str) else [m for i, m in enumerate(models) if m and m not in models[:i]]
+    today = quota_day()
+    last_quota = None
+    for model in chain:
+        if EXHAUSTED.get(model) == today:
+            continue
+        try:
+            for attempt in range(2):
+                result = fn(model, system, user, name, schema, max_tokens)
+                missing = [k for k in schema["required"] if k not in result]
+                if not missing:
+                    return result
+                log.warning("В ответе модели нет полей %s, повторяю", missing)
+            raise LLMError(f"Модель дважды вернула неполный ответ: {result}")
+        except LLMQuotaError as e:
+            last_quota = e
+            if "время" in str(e):
+                raise
+            log.warning("У модели %s кончился бесплатный лимит на сегодня", model)
+            _annotate("warning", "Дневной лимит", f"{model}: {e}")
+            EXHAUSTED[model] = today
+    raise last_quota or LLMQuotaError("у всех моделей кончился дневной лимит")
 
 
 SCORE_SCHEMA = {
@@ -245,7 +307,7 @@ def score(title: str, summary: str, text: str, source: str, recent: list) -> dic
         f"Текст статьи (начало):\n{text[:4000]}\n\n"
         f"Уже опубликовано или в очереди за последние дни:\n{recent_txt}"
     )
-    result = _call(CFG.model_fast, SCORE_SYSTEM, user, "score_news", SCORE_SCHEMA, 3000)
+    result = _call([CFG.model_fast, CFG.model_writer], SCORE_SYSTEM, user, "score_news", SCORE_SCHEMA, 3000)
     result["score"] = max(0, min(10, int(result["score"])))
     return result
 
@@ -264,13 +326,60 @@ WRITE_SCHEMA = {
 }
 
 
+BATCH_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "items": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer"},
+                    "score": {"type": "integer", "description": "Интересность 0–10"},
+                    "category": {"type": "string", "enum": CATEGORIES},
+                    "title_ru": {"type": "string", "description": "Суть новости по-русски, одна строка"},
+                    "duplicate_of": {"type": "integer", "description": "id такой же истории (из списка уже опубликованных или из этой же пачки), иначе 0"},
+                    "reason": {"type": "string", "description": "Почему такая оценка, коротко"},
+                },
+                "required": ["id", "score", "category", "title_ru", "duplicate_of", "reason"],
+            },
+        },
+    },
+    "required": ["items"],
+}
+
+
+def score_batch(items: list, recent: list) -> dict:
+    """Оценить сразу пачку новостей одним запросом — так бесплатного лимита хватает на весь день.
+    items: [{"id", "source", "title", "summary"}]. Возвращает {id: оценка}."""
+    recent_txt = "\n".join(f"id={r['id']}: {r['title_ru']}" for r in recent) or "(пока ничего)"
+    lines = [f"id={it['id']} | {it['source']} | {it['title']}" + (f" — {it['summary'][:300]}" if it.get("summary") else "")
+             for it in items]
+    user = (
+        "Оцени каждую новость из списка. Верни оценку для КАЖДОГО id.\n"
+        "Если две новости из списка про одно и то же — у менее подробной укажи duplicate_of = id другой.\n\n"
+        "НОВОСТИ:\n" + "\n".join(lines) +
+        f"\n\nУже опубликовано или в очереди за последние дни:\n{recent_txt}"
+    )
+    result = _call([CFG.model_fast, CFG.model_writer], SCORE_SYSTEM, user, "score_batch", BATCH_SCHEMA, 8000)
+    out = {}
+    for r in result.get("items", []):
+        try:
+            r["score"] = max(0, min(10, int(r.get("score", 0))))
+            r["duplicate_of"] = int(r.get("duplicate_of") or 0)
+            out[int(r["id"])] = r
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 def write_post(title: str, text: str, source: str, url: str, fix_notes: str = "", rates: str = "") -> dict:
     user = f"Источник: {source} ({url})\nЗаголовок: {title}\n\nТекст статьи:\n{text}\n"
     if rates:
         user += f"\nКурс для пересчёта: {rates}\n"
     if fix_notes:
         user += f"\nПрошлый вариант не прошёл проверку фактов. Исправь: {fix_notes}\n"
-    result = _call(CFG.model_writer, WRITE_SYSTEM, user, "write_post", WRITE_SCHEMA, 6000)
+    result = _call([CFG.model_writer, CFG.model_fast], WRITE_SYSTEM, user, "write_post", WRITE_SCHEMA, 6000)
     result["hashtags"] = result.get("hashtags", [])[:3]
     return result
 

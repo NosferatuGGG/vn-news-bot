@@ -63,6 +63,10 @@ class Telegram:
         )
         return res["message_id"]
 
+    def call_text(self, chat_id: str, text: str):
+        """Простое служебное сообщение без разметки."""
+        return self._call("sendMessage", chat_id=chat_id, text=text)
+
     def get_updates(self, offset: int, timeout: int = 25) -> list:
         if CFG.dry_run:
             return []
