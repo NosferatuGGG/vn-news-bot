@@ -50,7 +50,7 @@ def make_post(title: str, text: str, source: str, url: str) -> tuple[str, list[s
     return build_post(data, url, source), ([] if check["ok"] else check["problems"])
 
 
-def process(store: Store, tg: Telegram | None) -> bool:
+def process(store: Store, tg: Telegram | None, deadline: float | None = None) -> bool:
     """Возвращает False, если нейросеть или Telegram не ответили (новости дождутся следующего запуска)."""
     # предфильтр по ключевым словам — бесплатно; ждущие разбора тоже перепроверяем,
     # чтобы правки фильтра сразу действовали и на очередь
@@ -68,6 +68,11 @@ def process(store: Store, tg: Telegram | None) -> bool:
     log.info("К нейросети: %d из %d подходящих новостей", len(queue),
              len(store.by_status("candidate", limit=5000)))
     for row in queue:
+        if deadline and time.time() > deadline:
+            log.info("Время запуска вышло — остальные новости разберу в следующий раз")
+            break
+        check_buttons(store, tg)   # нажатия, сделанные пока идёт разбор, срабатывают сразу
+        item_started = time.time()
         try:
             art = fetch_article(row["url"])
             if art.published_at:
@@ -92,7 +97,7 @@ def process(store: Store, tg: Telegram | None) -> bool:
                 continue
 
             post, problems = make_post(row["title"], art.text, row["source"], row["url"])
-            log.info("  [%s/10 — ГОТОВ ПОСТ] %s", sc["score"], sc["title_ru"])
+            log.info("  [%s/10 — ГОТОВ ПОСТ] %s (%.0f с)", sc["score"], sc["title_ru"], time.time() - item_started)
 
             if problems or CFG.mode == "moderate":
                 # спорное — всегда через человека, даже в авто-режиме
@@ -112,9 +117,11 @@ def process(store: Store, tg: Telegram | None) -> bool:
         except llm.LLMError as err:
             # лимит или сбой нейросети: новость остаётся в очереди на разбор до следующего запуска
             log.error("Нейросеть недоступна: %s", err)
+            print(f"::error title=Нейросеть::{str(err)[:900]}", flush=True)
             return False
         except TelegramError as err:
             log.error("Telegram не принял черновик: %s", err)
+            print(f"::error title=Telegram::{str(err)[:900]}", flush=True)
             return False
         except Exception as err:  # noqa: BLE001
             log.exception("Ошибка на %s", row["url"])
@@ -192,17 +199,30 @@ def handle_updates(store: Store, tg: Telegram, timeout: int):
 
 
 # ---------- Точки входа ----------
+def check_buttons(store: Store, tg: Telegram | None, timeout: int = 0):
+    """Обработать нажатые кнопки модерации; сбой Telegram здесь не должен останавливать разбор."""
+    if tg is None or CFG.dry_run or not CFG.admin_chat_id:
+        return
+    try:
+        handle_updates(store, tg, timeout=timeout)
+    except Exception as err:  # noqa: BLE001
+        log.warning("Не удалось проверить кнопки: %s", err)
+
+
 def run_once(store: Store, tg: Telegram):
     """Один проход — для запуска по расписанию (GitHub Actions, cron)."""
-    if CFG.mode == "moderate" and not CFG.dry_run:
-        handle_updates(store, tg, timeout=0)   # сначала нажатые тобой кнопки
+    check_buttons(store, tg)          # сначала нажатые тобой кнопки
     collect(store)
-    llm_ok = process(store, tg)
+    # GitHub прерывает запуск через 15 минут — заканчиваем разбор заранее, чтобы успеть всё сохранить
+    llm_ok = process(store, tg, deadline=time.time() + CFG.run_budget_min * 60)
+    check_buttons(store, tg)          # и те, что нажаты, пока шёл разбор
     publish_from_queue(store, tg)
     store.prune(days=CFG.keep_days)
     if not llm_ok:
-        # красный запуск в GitHub = письмо тебе на почту
-        raise SystemExit("Нейросеть или Telegram не ответили — подробности выше в журнале (строки ERROR)")
+        # строка ::error:: видна прямо на странице запуска в GitHub; красный запуск = письмо на почту
+        print("::error title=Бот не смог доработать::Нейросеть или Telegram не ответили. "
+              "Подробности — в журнале шага «Запуск бота», строки с ошибкой.", flush=True)
+        raise SystemExit(1)
 
 
 def run_forever(store: Store, tg: Telegram):

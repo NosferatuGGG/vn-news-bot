@@ -8,6 +8,7 @@
 Ответ модели всегда — JSON строго по схеме, поэтому код не ломается от лишних слов."""
 import json
 import logging
+import os
 import re
 import time
 
@@ -35,6 +36,19 @@ _last_call = 0.0
 
 class LLMError(RuntimeError):
     pass
+
+
+_annotations = 0
+
+
+def _annotate(level: str, title: str, text: str):
+    """Пометка на странице запуска в GitHub (видна и через API) — чтобы причины сбоев были на виду."""
+    global _annotations
+    if os.getenv("GITHUB_ACTIONS") != "true" or _annotations >= 8:
+        return
+    _annotations += 1
+    text = text.replace("\n", " ").replace("%", "%25")
+    print(f"::{level} title={title}::{text}", flush=True)
 
 
 def _throttle():
@@ -66,6 +80,7 @@ def _post_with_retry(url: str, headers: dict, body: dict, attempts: int = 5) -> 
         if r.status_code in (429, 500, 502, 503, 529):
             delay = float(r.headers.get("retry-after") or 0) or min(60, 5 * 2 ** attempt)
             log.warning("Нейросеть ответила %s, жду %.0f с", r.status_code, delay)
+            _annotate("warning", f"Нейросеть {r.status_code}", r.text[:200])
             time.sleep(delay)
             continue
         if r.status_code >= 400:
@@ -171,6 +186,7 @@ def _call_gemini(model: str, system: str, user: str, name: str, schema: dict, ma
         except (LLMError, ValueError, KeyError, IndexError, TypeError) as e:
             errors.append(f"{route}: {str(e)[:300]}")
             log.warning("Gemini, способ %s не сработал: %s", route, str(e)[:300])
+            _annotate("warning", f"Gemini {route}", str(e)[:300])
             continue
         if _gemini_route != route:
             log.info("Gemini отвечает через способ %s", route)

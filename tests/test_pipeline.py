@@ -155,3 +155,17 @@ def test_llm_outage_keeps_news_for_next_run(tmp_path, monkeypatch):
     monkeypatch.setattr(llm, "score", down)
     assert main.process(store, Telegram("x")) is False
     assert store.get(1)["status"] == "candidate"
+
+
+def test_buttons_checked_during_long_run(tmp_path, monkeypatch):
+    """Нажатие «Сейчас», сделанное пока бот разбирает новости, обрабатывается в том же запуске."""
+    monkeypatch.setattr(CFG, "dry_run", False)
+    monkeypatch.setattr(CFG, "admin_chat_id", "42")
+    store = Store(str(tmp_path / "t.db"))
+    for i in range(3):
+        store.add_item(f"u{i}", "s", "Du khách Nga bị cướp", "", time.time())
+    monkeypatch.setattr(main, "fetch_article", lambda url: Article("x", "", None))  # короткий текст → без нейросети
+    calls = []
+    monkeypatch.setattr(main, "handle_updates", lambda store, tg, timeout: calls.append(timeout))
+    main.process(store, Telegram("x"))
+    assert len(calls) == 3

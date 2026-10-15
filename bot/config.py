@@ -60,6 +60,7 @@ class Config:
     min_score: int = _int("MIN_SCORE", 6)              # порог интересности 0–10
     max_age_hours: int = _int("MAX_AGE_HOURS", 36)     # старше — не берём
     max_llm_items_per_scan: int = _int("MAX_LLM_ITEMS_PER_SCAN", 25)
+    run_budget_min: int = _int("RUN_BUDGET_MIN", 9)    # сколько минут один запуск может разбирать новости
 
     # --- Расписание публикаций ---
     scan_interval_min: int = _int("SCAN_INTERVAL_MIN", 20)
