@@ -17,7 +17,13 @@ case "${1:-help}" in
     "$GH" run list -R "$REPO" -w bot.yml -L 8 ;;
   logs)
     ID="$("$GH" run list -R "$REPO" -w bot.yml -L 1 --json databaseId -q '.[0].databaseId')"
-    "$GH" run view "$ID" -R "$REPO" --log | grep -E "Запуск бота" | cut -f3- | sed -E 's/^[0-9TZ:.-]+ //' | tail -n 80 ;;
+    "$GH" run list -R "$REPO" -w bot.yml -L 1
+    echo
+    "$GH" run view "$ID" -R "$REPO" --log \
+      | awk -F'\t' '$2=="Запуск бота"{print $3}' \
+      | sed -E 's/^[0-9T:.-]+Z //' \
+      | awk 'shown; /##\[endgroup\]/{shown=1}' \
+      | tail -n 60 ;;
   stop)
     "$GH" workflow disable bot.yml -R "$REPO" && echo "Бот остановлен. Включить: $0 start" ;;
   start)
@@ -37,6 +43,17 @@ case "${1:-help}" in
     git -C "$DIR" commit -qm "Правки ${2:-}" && git -C "$DIR" push -q origin main \
       && echo "Изменения отправлены. Следующий запуск бота уже их учтёт." \
       || echo "Нечего отправлять — изменений нет." ;;
+  key)
+    PROVIDER="$("$GH" variable get LLM_PROVIDER -R "$REPO" 2>/dev/null || echo gemini)"
+    case "$PROVIDER" in
+      openrouter) NAME=OPENROUTER_API_KEY ;;
+      anthropic)  NAME=ANTHROPIC_API_KEY ;;
+      *)          NAME=GEMINI_API_KEY ;;
+    esac
+    echo "Вставь новый ключ (Cmd+V) и нажми Enter. Символы не будут видны — это нормально."
+    read -r -s -p "→ Ключ: " NEWKEY; echo
+    [ ${#NEWKEY} -ge 20 ] || { echo "Ключ слишком короткий — похоже, скопировался не целиком."; exit 1; }
+    printf '%s' "$NEWKEY" | "$GH" secret set "$NAME" -R "$REPO" && echo "Ключ обновлён. Проверить: $0 run, потом $0 logs" ;;
   open)
     open "https://github.com/$REPO/actions" 2>/dev/null || echo "https://github.com/$REPO/actions" ;;
   *)
@@ -53,6 +70,7 @@ ${B}Управление ботом «Новости Вьетнама»${X}  (р
   $0 set ИМЯ ЗНАЧЕНИЕ — поменять настройку, например: $0 set MAX_POSTS_PER_DAY 6
   $0 edit       — открыть тон и правила канала для правки
   $0 save       — отправить твои правки на GitHub
+  $0 key        — заменить ключ нейросети
   $0 open       — открыть страницу запусков в браузере
 EOF
     ;;

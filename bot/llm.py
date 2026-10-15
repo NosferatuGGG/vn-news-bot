@@ -21,9 +21,13 @@ log = logging.getLogger(__name__)
 CATEGORIES = ["russians", "crime", "scam", "visa_law", "money", "flights", "weather", "incident", "viral", "other"]
 
 OPENAI_COMPAT_URLS = {
-    "gemini": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
     "openrouter": "https://openrouter.ai/api/v1/chat/completions",
 }
+# Gemini вызываем через «родные» адреса Google с ключом в заголовке x-goog-api-key:
+# так работают и старые ключи (AIza…), и новые ключи AI Studio (AQ.…).
+# Основной адрес — Interactions API (его сейчас показывает документация Google),
+# запасной — классический generateContent.
+GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
 
 _http = httpx.Client(timeout=120)
 _last_call = 0.0
@@ -97,6 +101,74 @@ def _call_openai_compat(model: str, system: str, user: str, name: str, schema: d
     return _extract_json(content)
 
 
+def _gemini_interactions_text(data: dict) -> str:
+    steps = data.get("steps") or data.get("outputs") or []
+    texts = []
+    for step in steps:
+        if not isinstance(step, dict) or step.get("type") not in ("model_output", None):
+            continue
+        content = step.get("content") or []
+        if isinstance(content, dict):
+            content = [content]
+        texts += [c.get("text", "") for c in content if isinstance(c, dict) and c.get("type", "text") == "text"]
+        if step.get("text"):
+            texts.append(step["text"])
+    return "".join(texts) or data.get("output_text", "")
+
+
+def _gemini_generate_text(data: dict) -> str:
+    candidates = data.get("candidates") or []
+    if not candidates:
+        reason = (data.get("promptFeedback") or {}).get("blockReason", "пустой ответ")
+        raise LLMError(f"Gemini не ответил: {reason}")
+    parts = (candidates[0].get("content") or {}).get("parts") or []
+    return "".join(p.get("text", "") for p in parts if not p.get("thought"))
+
+
+def _call_gemini(model: str, system: str, user: str, name: str, schema: dict, max_tokens: int) -> dict:
+    headers = {"x-goog-api-key": CFG.llm_api_key}
+    instruction = system + "\n\nОтвет — только JSON-объект по схеме, без пояснений."
+    with_schema_text = instruction + "\nСхема: " + json.dumps(schema, ensure_ascii=False)
+    attempts = [
+        ("interactions", f"{GEMINI_BASE}/interactions", {
+            "model": model,
+            "input": user,
+            "system_instruction": instruction,
+            "generation_config": {"max_output_tokens": max_tokens},
+            "response_format": {"type": "text", "mime_type": "application/json", "schema": schema},
+            "store": False,
+        }),
+        ("generate", f"{GEMINI_BASE}/models/{model}:generateContent", {
+            "systemInstruction": {"parts": [{"text": instruction}]},
+            "contents": [{"role": "user", "parts": [{"text": user}]}],
+            "generationConfig": {"maxOutputTokens": max_tokens, "responseMimeType": "application/json",
+                                 "responseJsonSchema": schema},
+        }),
+        ("generate", f"{GEMINI_BASE}/models/{model}:generateContent", {
+            "systemInstruction": {"parts": [{"text": with_schema_text}]},
+            "contents": [{"role": "user", "parts": [{"text": user}]}],
+            "generationConfig": {"maxOutputTokens": max_tokens, "responseMimeType": "application/json"},
+        }),
+    ]
+    last_error = None
+    for kind, url, body in attempts:
+        try:
+            data = _post_with_retry(url, headers, body)
+        except LLMError as e:
+            msg = str(e)
+            key_problem = "API key" in msg or "API_KEY" in msg or "UNAUTHENTICATED" in msg
+            if key_problem or not msg.startswith(("400", "404")):
+                raise
+            log.info("Gemini %s не подошёл (%s), пробую другой способ", kind, msg[:120])
+            last_error = e
+            continue
+        text = _gemini_interactions_text(data) if kind == "interactions" else _gemini_generate_text(data)
+        if text.strip():
+            return _extract_json(text)
+        last_error = LLMError(f"Gemini вернул пустой ответ ({kind})")
+    raise last_error or LLMError("Gemini не ответил")
+
+
 def _call_anthropic(model: str, system: str, user: str, name: str, schema: dict, max_tokens: int) -> dict:
     body = {
         "model": model,
@@ -117,7 +189,7 @@ def _call_anthropic(model: str, system: str, user: str, name: str, schema: dict,
 # max_tokens с запасом: у новых моделей «размышления» тоже считаются в ответ,
 # а платишь всё равно только за реально потраченное
 def _call(model: str, system: str, user: str, name: str, schema: dict, max_tokens: int = 3000) -> dict:
-    fn = _call_anthropic if CFG.llm_provider == "anthropic" else _call_openai_compat
+    fn = {"anthropic": _call_anthropic, "gemini": _call_gemini}.get(CFG.llm_provider, _call_openai_compat)
     for attempt in range(2):
         result = fn(model, system, user, name, schema, max_tokens)
         missing = [k for k in schema["required"] if k not in result]

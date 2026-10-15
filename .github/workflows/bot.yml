@@ -38,6 +38,7 @@ jobs:
 
       - name: Запуск бота
         env:
+          TZ: Asia/Ho_Chi_Minh          # время в журнале — по Вьетнаму
           # секреты (Settings → Secrets and variables → Actions → Secrets)
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
@@ -58,8 +59,8 @@ jobs:
           CHANNEL_SIGNATURE: ${{ vars.CHANNEL_SIGNATURE }}
           RATES: ${{ vars.RATES }}
           DRY_RUN: ${{ vars.DRY_RUN }}
-          # за один запуск — не больше 10 новостей через нейросеть, чтобы уложиться в бесплатные лимиты
-          MAX_LLM_ITEMS_PER_SCAN: ${{ vars.MAX_LLM_ITEMS_PER_SCAN || '10' }}
+          # за один запуск — не больше 20 новостей через нейросеть, чтобы уложиться в бесплатные лимиты
+          MAX_LLM_ITEMS_PER_SCAN: ${{ vars.MAX_LLM_ITEMS_PER_SCAN || '20' }}
         run: python -m bot.main --once
 
       - name: Сохраняем память бота

@@ -57,7 +57,7 @@ class Config:
     dry_run: bool = _bool("DRY_RUN", False)  # ничего не отправлять, только печатать
 
     # --- Отбор ---
-    min_score: int = _int("MIN_SCORE", 7)              # порог интересности 0–10
+    min_score: int = _int("MIN_SCORE", 6)              # порог интересности 0–10
     max_age_hours: int = _int("MAX_AGE_HOURS", 36)     # старше — не берём
     max_llm_items_per_scan: int = _int("MAX_LLM_ITEMS_PER_SCAN", 25)
 

@@ -52,17 +52,22 @@ def make_post(title: str, text: str, source: str, url: str) -> tuple[str, list[s
 
 def process(store: Store, tg: Telegram | None) -> bool:
     """Возвращает False, если нейросеть или Telegram не ответили (новости дождутся следующего запуска)."""
-    # предфильтр по ключевым словам — бесплатно
-    for row in store.by_status("new", limit=500):
+    # предфильтр по ключевым словам — бесплатно; ждущие разбора тоже перепроверяем,
+    # чтобы правки фильтра сразу действовали и на очередь
+    cutoff = time.time() - CFG.max_age_hours * 3600
+    for row in list(store.by_status("new", limit=2000)) + list(store.by_status("candidate", limit=2000)):
         ok, why = prefilter(row["title"], row["summary"] or "")
+        if ok and row["published_at"] < cutoff:
+            ok, why = False, "old"
         store.update(row["id"], status="candidate" if ok else "filtered", note=why)
 
-    cutoff = time.time() - CFG.max_age_hours * 3600
-    for row in store.by_status("candidate", limit=1000):
-        if row["published_at"] < cutoff:
-            store.update(row["id"], status="filtered", note="old")
-
-    for row in store.by_status("candidate", limit=CFG.max_llm_items_per_scan):
+    # сначала про иностранцев и визы, потом криминал в «наших» городах, потом остальное; внутри — свежие
+    order = ("CASE note WHEN 'strong' THEN 0 WHEN 'local' THEN 1 WHEN 'crime' THEN 2 ELSE 3 END, "
+             "published_at DESC")
+    queue = store.by_status("candidate", limit=CFG.max_llm_items_per_scan, order=order)
+    log.info("К нейросети: %d из %d подходящих новостей", len(queue),
+             len(store.by_status("candidate", limit=5000)))
+    for row in queue:
         try:
             art = fetch_article(row["url"])
             if art.published_at:
@@ -78,14 +83,16 @@ def process(store: Store, tg: Telegram | None) -> bool:
             fields = dict(score=sc["score"], category=sc["category"], title_ru=sc["title_ru"],
                           image=art.image, note=sc["reason"][:300])
             if sc.get("duplicate_of"):
+                log.info("  [дубль] %s", sc["title_ru"])
                 store.update(row["id"], status="duplicate", **fields)
                 continue
             if sc["score"] < CFG.min_score:
+                log.info("  [%s/10 — мимо] %s", sc["score"], sc["title_ru"])
                 store.update(row["id"], status="low", **fields)
                 continue
 
             post, problems = make_post(row["title"], art.text, row["source"], row["url"])
-            log.info("Готов пост [%s] %s", sc["score"], sc["title_ru"])
+            log.info("  [%s/10 — ГОТОВ ПОСТ] %s", sc["score"], sc["title_ru"])
 
             if problems or CFG.mode == "moderate":
                 # спорное — всегда через человека, даже в авто-режиме
@@ -230,7 +237,9 @@ def test_url(url: str):
 
 
 def main():
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M")
+    # технические строки о каждом запросе в журнале не нужны
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     ap = argparse.ArgumentParser()
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--test-url")

@@ -6,10 +6,15 @@ import re
 STRONG = [
     r"\bNga\b", r"người Nga", r"khách Nga", r"quốc tịch Nga", r"Russia", r"Russian",
     r"người nước ngoài", r"du khách", r"khách (Tây|quốc tế|nước ngoài)", r"foreigner", r"tourist",
-    r"Nha Trang", r"Khánh Hòa", r"Cam Ranh", r"Ninh Hòa", r"Đà Lạt", r"Phú Quốc", r"Đà Nẵng",
-    r"Vũng Tàu", r"Mũi Né", r"Phan Thiết", r"Hội An", r"Quy Nhơn",
     r"thị thực", r"\bvisa\b", r"miễn thị thực", r"xuất nhập cảnh", r"tạm trú", r"trục xuất", r"deport",
     r"Aeroflot", r"bay thẳng", r"Interpol", r"truy nã quốc tế",
+]
+
+# «Наши» города: сами по себе не повод (там много скучных местных новостей),
+# но криминал или новые правила в этих местах идут в первую очередь
+PLACES = [
+    r"Nha Trang", r"Khánh Hòa", r"Cam Ranh", r"Ninh Hòa", r"Đà Lạt", r"Phú Quốc", r"Đà Nẵng",
+    r"Vũng Tàu", r"Mũi Né", r"Phan Thiết", r"Hội An", r"Quy Nhơn",
 ]
 
 # Криминал и происшествия — интересно, если громко
@@ -38,23 +43,33 @@ _nga = re.compile(r"\bNga\b")
 _strong = re.compile("|".join(p for p in STRONG if p != r"\bNga\b"), re.IGNORECASE)
 _crime = re.compile("|".join(CRIME), re.IGNORECASE)
 _laws = re.compile("|".join(LAWS), re.IGNORECASE)
+_places = re.compile("|".join(PLACES), re.IGNORECASE)
 
 # Явный скучняк — отсекаем сразу
 BORING = re.compile(
     r"Hội nghị|Ban Chấp hành|Đảng ủy|Tỉnh ủy|Nghị quyết|tiếp công dân|bồi dưỡng|tập huấn|"
     r"chuyển đổi số|nông thôn mới|phong trào|thi đua|khen thưởng|kỷ niệm|đại hội|"
-    r"giải ngân|đầu tư công|quy hoạch",
+    r"giải ngân|đầu tư công|quy hoạch|Hội Liên hiệp Phụ nữ|phụ nữ Việt Nam|gặp mặt|tọa đàm|về nguồn|"
+    r"ngày thành lập|tuyên truyền|ra quân|hội thi|hội thao|phòng cháy|chữa cháy|PCCC|lịch tiếp|"
+    r"trao tặng|trao quà|học bổng|bổ nhiệm|tri ân|biểu dương",
     re.IGNORECASE,
 )
 
+# Порядок разбора: чем меньше число, тем раньше новость попадёт к нейросети
+PRIORITY = {"strong": 0, "local": 1, "crime": 2, "laws": 3}
+
 
 def prefilter(title: str, summary: str) -> tuple[bool, str]:
+    """Возвращает (пропустить ли к нейросети, класс новости)."""
     text = f"{title} {summary}"
     strong = bool(_nga.search(text) or _strong.search(text))
     if BORING.search(title) and not strong:
         return False, "boring"
     if strong:
         return True, "strong"
+    hot = bool(_crime.search(text) or _laws.search(text))
+    if hot and _places.search(text):
+        return True, "local"
     if _crime.search(text):
         return True, "crime"
     if _laws.search(text):

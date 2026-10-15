@@ -34,14 +34,15 @@ SOURCES: list[Source] = [
         "Báo Khánh Hòa",
         "https://baokhanhhoa.vn/phap-luat/",
         kind="html",
-        link_pattern=r"^https://baokhanhhoa\.vn/[a-z0-9\-/]+/20\d{4}/[a-z0-9\-]+/?$",
+        # только статьи самой рубрики, без ссылок на «женсовет» и политику из боковых колонок
+        link_pattern=r"^https://baokhanhhoa\.vn/phap-luat/([a-z0-9\-]+/)?20\d{4}/[a-z0-9\-]+/?$",
         verified=True,
     ),
     Source(
         "Báo Khánh Hòa",
         "https://baokhanhhoa.vn/xa-hoi/",
         kind="html",
-        link_pattern=r"^https://baokhanhhoa\.vn/[a-z0-9\-/]+/20\d{4}/[a-z0-9\-]+/?$",
+        link_pattern=r"^https://baokhanhhoa\.vn/xa-hoi/([a-z0-9\-]+/)?20\d{4}/[a-z0-9\-]+/?$",
     ),
 
     # --- Англоязычная версия VnExpress: хорошо ловит истории про иностранцев ---
