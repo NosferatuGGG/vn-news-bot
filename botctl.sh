@@ -40,9 +40,13 @@ case "${1:-help}" in
     echo "Поправь текст, сохрани (Cmd+S) и выполни: $0 save" ;;
   save)
     git -C "$DIR" add -A
-    git -C "$DIR" commit -qm "Правки ${2:-}" && git -C "$DIR" push -q origin main \
+    git -C "$DIR" commit -qm "Правки ${2:-}" >/dev/null 2>&1 || { echo "Нечего отправлять — изменений нет."; exit 0; }
+    git -C "$DIR" pull -q --rebase origin main && git -C "$DIR" push -q origin main \
       && echo "Изменения отправлены. Следующий запуск бота уже их учтёт." \
-      || echo "Нечего отправлять — изменений нет." ;;
+      || echo "Не получилось отправить — пришли этот текст в чат Claude." ;;
+  sync)
+    git -C "$DIR" pull -q --rebase origin main && chmod +x "$DIR/botctl.sh" \
+      && echo "Копия бота на этом компьютере обновлена до последней версии." ;;
   key)
     PROVIDER="$("$GH" variable get LLM_PROVIDER -R "$REPO" 2>/dev/null || echo gemini)"
     case "$PROVIDER" in
@@ -70,6 +74,7 @@ ${B}Управление ботом «Новости Вьетнама»${X}  (р
   $0 set ИМЯ ЗНАЧЕНИЕ — поменять настройку, например: $0 set MAX_POSTS_PER_DAY 6
   $0 edit       — открыть тон и правила канала для правки
   $0 save       — отправить твои правки на GitHub
+  $0 sync       — скачать последнюю версию бота с GitHub
   $0 key        — заменить ключ нейросети
   $0 open       — открыть страницу запусков в браузере
 EOF
