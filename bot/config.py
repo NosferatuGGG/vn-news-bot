@@ -62,7 +62,8 @@ class Config:
     max_llm_items_per_scan: int = _int("MAX_LLM_ITEMS_PER_SCAN", 25)
     run_budget_min: int = _int("RUN_BUDGET_MIN", 9)    # сколько минут один запуск может разбирать новости
     score_batch_size: int = _int("SCORE_BATCH_SIZE", 30)      # сколько заголовков оценивать одним запросом
-    max_writes_per_run: int = _int("MAX_WRITES_PER_RUN", 2)   # сколько черновиков писать за один запуск
+    max_writes_per_run: int = _int("MAX_WRITES_PER_RUN", 3)   # сколько карточек готовить за один запуск
+    loud_score: int = _int("LOUD_SCORE", 8)   # карточки с такой оценкой и выше приходят со звуком
 
     # --- Расписание публикаций ---
     scan_interval_min: int = _int("SCAN_INTERVAL_MIN", 20)

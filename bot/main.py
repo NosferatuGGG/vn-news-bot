@@ -20,7 +20,7 @@ from .fetch import fetch_article, fetch_source
 from .filters import prefilter
 from .sources import SOURCES
 from .store import Store
-from .telegram import Telegram, TelegramError, build_post
+from .telegram import Telegram, TelegramError, build_card, build_post, card_buttons, marked
 
 log = logging.getLogger("bot")
 
@@ -121,8 +121,8 @@ def score_candidates(store: Store):
             store.update(row["id"], status="scored", **fields)
 
 
-def write_drafts(store: Store, tg: Telegram | None, deadline: float | None):
-    """Шаг 2: самые интересные из оценённых — прочитать целиком, переписать, проверить, прислать."""
+def send_briefs(store: Store, tg: Telegram | None, deadline: float | None):
+    """Шаг 2: самые интересные из оценённых — прочитать целиком, сделать выжимку на русском, прислать тебе."""
     todo = store.by_status("scored", limit=CFG.max_writes_per_run, order="score DESC, published_at DESC")
     for row in todo:
         if deadline and time.time() > deadline:
@@ -144,33 +144,34 @@ def write_drafts(store: Store, tg: Telegram | None, deadline: float | None):
         if len(art.text) < 200:
             store.update(row["id"], status="error", note="no text")
             continue
-        post, problems = make_post(row["title"], art.text, row["source"], row["url"])
-        log.info("  [%s/10 — ГОТОВ ПОСТ] %s (%.0f с)", row["score"], row["title_ru"], time.time() - started)
-        if problems or CFG.mode == "moderate":
-            # спорное — всегда через человека, даже в авто-режиме
-            if tg and CFG.admin_chat_id:
-                head = f"⭐ {row['score']}/10 · {html.escape(row['category'] or '')}\n"
-                if problems:
-                    head += "⚠️ Фактчек сомневается: " + html.escape("; ".join(problems)[:300]) + "\n"
-                tg.send_post(CFG.admin_chat_id, head + "\n" + post, art.image, buttons=[[
-                    {"text": "✅ В очередь", "callback_data": f"q:{row['id']}"},
-                    {"text": "🚀 Сейчас", "callback_data": f"now:{row['id']}"},
-                    {"text": "❌ Мимо", "callback_data": f"skip:{row['id']}"},
-                ]])
-            # статус меняем только после успешной отправки — иначе черновик потеряется
-            store.update(row["id"], status="review", post_html=post, image=art.image)
-        else:
-            store.update(row["id"], status="queued", post_html=post, image=art.image)
+        data = llm.brief(row["title"], art.text, row["source"], row["url"], rates=CFG.rates)
+        plain = "\n".join([data["headline"], data["summary"], *data["facts"], *data["numbers"]])
+        check = llm.fact_check(plain, art.text)
+        problems = [] if check.get("ok") else check.get("problems", [])
+        card = build_card(data, row["score"], row["category"] or "", row["source"], row["url"], problems)
+        msg_id, kind = 0, "text"
+        if tg and CFG.admin_chat_id:
+            msg_id, kind = tg.send_card(CFG.admin_chat_id, card, art.image, card_buttons(row["id"], "sent"),
+                                        silent=row["score"] < CFG.loud_score)
+        # статус меняем только после успешной отправки — иначе карточка потеряется
+        store.update(row["id"], status="sent", post_html=card, image=art.image, tg_message_id=msg_id,
+                     card_kind=kind, title_ru=data["headline"])
+        log.info("  [%s/10 — ПРИСЛАЛ] %s (%.0f с)", row["score"], data["headline"], time.time() - started)
 
 
 def process(store: Store, tg: Telegram | None, deadline: float | None = None) -> bool:
     """Возвращает False только при настоящем сбое (не при дневном лимите — он обнуляется сам)."""
+    if store.kv_get("cards_v2") != "1":
+        # черновики старого формата пересылаем заново — уже карточками
+        for row in store.by_status("review", limit=100) + store.by_status("queued", limit=100):
+            store.update(row["id"], status="scored")
+        store.kv_set("cards_v2", "1")
     prefilter_queue(store)
     _load_quota_state(store)
     llm.DEADLINE = deadline
     try:
         score_candidates(store)
-        write_drafts(store, tg, deadline)
+        send_briefs(store, tg, deadline)
         return True
     except llm.LLMQuotaError as err:
         log.info("Нейросеть на паузе: %s. Продолжу в следующий запуск.", err)
@@ -235,6 +236,10 @@ def handle_updates(store: Store, tg: Telegram, timeout: int):
             store.kv_set("tg_offset", upd["update_id"] + 1)
 
 
+ACTIONS = {"pub": "published", "skip": "skipped", "unpub": "sent"}
+TOASTS = {"pub": "Отмечено: опубликовано", "skip": "Пропущено", "unpub": "Отметка снята"}
+
+
 def _handle_one(store: Store, tg: Telegram, upd: dict):
     cb = upd.get("callback_query")
     if not cb or ":" not in cb.get("data", ""):
@@ -244,38 +249,43 @@ def _handle_one(store: Store, tg: Telegram, upd: dict):
     action, item_id = cb["data"].split(":", 1)
     row = store.get(int(item_id)) if item_id.isdigit() else None
     msg = cb["message"]
-    if not row:
+    chat_id, message_id = msg["chat"]["id"], msg["message_id"]
+
+    def toast(text):
+        try:
+            tg.answer_callback(cb["id"], text)
+        except Exception as err:  # noqa: BLE001 — нажатие обработано позже, Telegram уже не ждёт ответа
+            log.info("Telegram не принял ответ на кнопку: %s", err)
+
+    if not row or action not in (*ACTIONS, "full"):
+        toast("Эта кнопка от старой версии бота")
         return
     try:
-        if action == "q":
-            store.update(row["id"], status="queued")
-            label, toast = "✅ В очереди", "В очереди"
-        elif action == "now":
-            if row["status"] != "posted":
-                publish(store, tg, row["id"])
-            label, toast = "🚀 Опубликовано", "Опубликовано"
-        elif action == "skip":
-            store.update(row["id"], status="skipped")
-            label, toast = "❌ Пропущено", "Пропущено"
-        else:
-            return
+        if action in ACTIONS:
+            status = ACTIONS[action]
+            store.update(row["id"], status=status)
+            if row["post_html"]:
+                kind = row["card_kind"] or ("photo" if "photo" in (msg.keys()) else "text")
+                tg.edit_card(chat_id, message_id, kind, marked(row["post_html"], status), row["image"] or "",
+                             card_buttons(row["id"], status))
+            log.info("Кнопка «%s»: %s", TOASTS[action], row["title_ru"])
+            toast(TOASTS[action])
+        else:  # полный перевод
+            toast("Перевожу…")
+            art = fetch_article(row["url"])
+            text = llm.translate(art.text)
+            tg.reply_long(chat_id, message_id, row["title_ru"] or row["title"], text)
+            log.info("Полный перевод: %s", row["title_ru"])
+    except llm.LLMQuotaError:
+        tg.call_text(CFG.admin_chat_id, "⏳ Лимит нейросети на сегодня закончился — полный перевод пришлю после 14:00 "
+                                        "по Вьетнаму. Нажми кнопку ещё раз после этого времени.")
     except Exception as err:  # noqa: BLE001
         log.error("Не смог выполнить кнопку %s для %s: %s", action, row["id"], err)
         print(f"::error title=Кнопка::{str(err)[:500]}", flush=True)
         try:
-            tg.call_text(CFG.admin_chat_id, f"⚠️ Не получилось опубликовать «{row['title_ru']}»: {str(err)[:300]}")
+            tg.call_text(CFG.admin_chat_id, f"⚠️ Кнопка не сработала для «{row['title_ru'] or row['title']}»: {str(err)[:300]}")
         except Exception:  # noqa: BLE001
             pass
-        return
-    log.info("Кнопка «%s»: %s", toast, row["title_ru"])
-    # при запуске по расписанию нажатие обрабатывается позже — Telegram может
-    # уже не принять ответ на кнопку; само действие при этом выполнено
-    for call in (lambda: tg.answer_callback(cb["id"], toast),
-                 lambda: tg.edit_buttons(msg["chat"]["id"], msg["message_id"], label)):
-        try:
-            call()
-        except Exception as err:  # noqa: BLE001
-            log.info("Telegram не принял ответ на кнопку: %s", err)
 
 
 # ---------- Точки входа ----------
@@ -309,7 +319,6 @@ def run_once(store: Store, tg: Telegram):
     # GitHub прерывает запуск через 15 минут — заканчиваем разбор заранее, чтобы успеть всё сохранить
     llm_ok = process(store, tg, deadline=time.time() + CFG.run_budget_min * 60)
     check_buttons(store, tg)          # и те, что нажаты, пока шёл разбор
-    publish_from_queue(store, tg)
     store.prune(days=CFG.keep_days)
     counts = dict(store.db.execute("SELECT status, COUNT(*) FROM items GROUP BY status").fetchall())
     _notice("Итог: " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
@@ -329,7 +338,6 @@ def run_forever(store: Store, tg: Telegram):
                 process(store, tg)
                 next_scan = time.time() + CFG.scan_interval_min * 60
                 store.prune(days=CFG.keep_days)
-            publish_from_queue(store, tg)
             if CFG.mode == "moderate" and not CFG.dry_run:
                 handle_updates(store, tg, timeout=25)
             else:

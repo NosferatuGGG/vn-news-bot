@@ -91,10 +91,10 @@ def test_full_pipeline(tmp_path, monkeypatch):
         return out
 
     monkeypatch.setattr(llm, "score_batch", fake_batch)
-    monkeypatch.setattr(llm, "write_post", lambda *a, **k: {
-        "emoji": "🚨", "headline": "Заголовок", "body": "Текст", "takeaway": "Держите сумку", "hashtags": ["#Нячанг"]})
-    checks = iter([{"ok": False, "problems": ["лишняя цифра"]}, {"ok": True, "problems": []},
-                   {"ok": True, "problems": []}])
+    monkeypatch.setattr(llm, "brief", lambda *a, **k: {
+        "emoji": "🚨", "headline": "Заголовок", "place": "Нячанг", "summary": "Суть", "facts": ["факт <1>"],
+        "numbers": ["6 000 млрд донгов"], "why": "рядом с нами"})
+    checks = iter([{"ok": False, "problems": ["лишняя цифра"]}, {"ok": True, "problems": []}])
     monkeypatch.setattr(llm, "fact_check", lambda *a: next(checks))
 
     store = Store(str(tmp_path / "t.db"))
@@ -107,14 +107,15 @@ def test_full_pipeline(tmp_path, monkeypatch):
     assert statuses["https://bkh.vn/hoi-nghi"] == "filtered"          # скучное отсечено без нейросети
     assert statuses["https://vne.vn/ga"] == "filtered"                # «Ngã ba» ≠ «Nga»
     assert statuses["https://vne.vn/meh"] == "low"
-    assert statuses["https://bkh.vn/giat-tui"] == "queued"
-    assert statuses["https://vne.vn/phu-quoc"] == "queued"
+    assert statuses["https://bkh.vn/giat-tui"] == "sent"
+    assert statuses["https://vne.vn/phu-quoc"] == "sent"
     assert statuses["https://tn.vn/phu-quoc"] == "duplicate"          # дубль с другого сайта
     assert len(batches) == 1 and len(batches[0]) == 4                 # все оценены ОДНИМ запросом
 
-    main.publish_from_queue(store, tg)
-    posted = store.by_status("posted")
-    assert len(posted) == 1 and posted[0]["score"] == 10              # первым уходит самое интересное
+    cards = {r["score"]: r["post_html"] for r in store.by_status("sent")}
+    assert "<b>Суть:</b> Суть" in cards[10] and "• факт &lt;1&gt;" in cards[10] and "Оригинал:" in cards[10]
+    assert "Сверь с оригиналом: лишняя цифра" in cards[10]           # первой готовится самая интересная
+    assert "Сверь" not in cards[9]
 
 
 def test_daily_limit(tmp_path, monkeypatch):
@@ -130,9 +131,11 @@ def test_late_button_press_still_works(tmp_path, monkeypatch):
     monkeypatch.setattr(CFG, "admin_chat_id", "42")
     store = Store(str(tmp_path / "t.db"))
     store.add_item("u1", "s", "t", "", time.time())
-    store.update(1, status="review", post_html="<b>пост</b>")
+    store.update(1, status="sent", post_html="<b>пост</b>", card_kind="photo", tg_message_id=5)
     tg = Telegram("x")
-    upd = [{"update_id": 7, "callback_query": {"id": "c", "data": "q:1", "from": {"id": 42},
+    edits = []
+    monkeypatch.setattr(tg, "edit_card", lambda *a, **k: edits.append(a))
+    upd = [{"update_id": 7, "callback_query": {"id": "c", "data": "pub:1", "from": {"id": 42},
                                                "message": {"chat": {"id": 42}, "message_id": 5}}}]
     monkeypatch.setattr(tg, "get_updates", lambda offset, timeout: upd)
 
@@ -142,7 +145,8 @@ def test_late_button_press_still_works(tmp_path, monkeypatch):
     monkeypatch.setattr(tg, "answer_callback", too_old)
     monkeypatch.setattr(tg, "edit_buttons", too_old)
     main.handle_updates(store, tg, timeout=0)
-    assert store.get(1)["status"] == "queued"
+    assert store.get(1)["status"] == "published"
+    assert edits and edits[0][2] == "photo" and edits[0][3].startswith("✅ <b>ОПУБЛИКОВАНО</b>")
     assert store.kv_get("tg_offset") == "8"
 
 
@@ -208,18 +212,71 @@ def test_buttons_checked_during_long_run(tmp_path, monkeypatch):
     assert len(calls) == 3
 
 
-def test_failed_publish_keeps_working_and_tells_you(tmp_path, monkeypatch):
+def _press(store, tg, monkeypatch, data, update_id=9):
+    upd = [{"update_id": update_id, "callback_query": {"id": "c", "data": data, "from": {"id": 42},
+                                                       "message": {"chat": {"id": 42}, "message_id": 5}}}]
+    monkeypatch.setattr(tg, "get_updates", lambda offset, timeout: upd)
+    main.handle_updates(store, tg, timeout=0)
+
+
+def test_publish_mark_and_undo(tmp_path, monkeypatch):
     monkeypatch.setattr(CFG, "admin_chat_id", "42")
     store = Store(str(tmp_path / "t.db"))
     store.add_item("u1", "s", "t", "", time.time())
-    store.update(1, status="review", post_html="<b>пост</b>", title_ru="Новость")
+    store.update(1, status="sent", post_html="КАРТОЧКА", card_kind="text", image="img", title_ru="Новость")
     tg = Telegram("x")
-    upd = [{"update_id": 9, "callback_query": {"id": "c", "data": "now:1", "from": {"id": 42},
-                                               "message": {"chat": {"id": 42}, "message_id": 5}}}]
-    monkeypatch.setattr(tg, "get_updates", lambda offset, timeout: upd)
-    monkeypatch.setattr(tg, "send_post", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("chat not found")))
+    edits = []
+    monkeypatch.setattr(tg, "edit_card", lambda chat, mid, kind, text, image, buttons: edits.append((kind, text, buttons)))
+    monkeypatch.setattr(tg, "answer_callback", lambda *a: None)
+    _press(store, tg, monkeypatch, "pub:1")
+    assert store.get(1)["status"] == "published" and edits[-1][1].startswith("✅")
+    assert edits[-1][2][0][0]["callback_data"] == "unpub:1"
+    _press(store, tg, monkeypatch, "unpub:1", 10)
+    assert store.get(1)["status"] == "sent" and edits[-1][1] == "КАРТОЧКА"     # отметка снята, карточка как была
+    _press(store, tg, monkeypatch, "skip:1", 11)
+    assert store.get(1)["status"] == "skipped" and edits[-1][1].startswith("🚫")
+
+
+def test_full_translation_replies_to_card(tmp_path, monkeypatch):
+    monkeypatch.setattr(CFG, "admin_chat_id", "42")
+    store = Store(str(tmp_path / "t.db"))
+    store.add_item("u1", "s", "t", "", time.time())
+    store.update(1, status="sent", post_html="КАРТОЧКА", title_ru="Новость")
+    tg = Telegram("x")
+    monkeypatch.setattr(tg, "answer_callback", lambda *a: None)
+    monkeypatch.setattr(main, "fetch_article", lambda url: Article("Bài báo " * 50, "", None))
+    monkeypatch.setattr(llm, "translate", lambda text: "Полный перевод статьи")
+    replies = []
+    monkeypatch.setattr(tg, "reply_long", lambda chat, reply_to, title, text: replies.append((reply_to, text)))
+    _press(store, tg, monkeypatch, "full:1")
+    assert replies == [(5, "Полный перевод статьи")] and store.get(1)["status"] == "sent"
+
+
+def test_failed_button_tells_you(tmp_path, monkeypatch):
+    monkeypatch.setattr(CFG, "admin_chat_id", "42")
+    store = Store(str(tmp_path / "t.db"))
+    store.add_item("u1", "s", "t", "", time.time())
+    store.update(1, status="sent", post_html="КАРТОЧКА", title_ru="Новость")
+    tg = Telegram("x")
+    monkeypatch.setattr(tg, "edit_card", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("message not found")))
     told = []
     monkeypatch.setattr(tg, "call_text", lambda chat, text: told.append(text))
-    main.handle_updates(store, tg, timeout=0)
-    assert store.get(1)["status"] == "review"
-    assert told and "chat not found" in told[0]
+    _press(store, tg, monkeypatch, "pub:1")
+    assert told and "message not found" in told[0]
+
+
+def test_card_layout_and_long_card_goes_as_text(monkeypatch):
+    from bot.telegram import build_card
+    monkeypatch.setattr(CFG, "dry_run", False)
+    card = build_card({"emoji": "🚨", "headline": "Сумку вырвали", "place": "Нячанг", "summary": "Суть.",
+                       "facts": ["8 октября, 13:30"], "numbers": [], "why": "рядом"}, 9, "crime", "Báo Khánh Hòa", "https://x/a?b=1&c=2")
+    assert card.startswith("🚨 <b>9/10 · Нячанг · криминал</b>") and "Цифры" not in card and "&amp;c=2" in card
+    tg = Telegram("x")
+    sent = []
+    monkeypatch.setattr(tg, "_call", lambda method, **p: sent.append((method, p)) or {"message_id": 7})
+    assert tg.send_card("42", "x" * 2000, "https://img/1.jpg", []) == (7, "text")
+    assert sent[0][0] == "sendMessage" and sent[0][1]["link_preview_options"]["url"] == "https://img/1.jpg"
+    sent.clear()
+    tg.reply_long("42", 5, "Новость", "\n".join(["абзац " * 100] * 20))
+    assert len(sent) > 1 and sent[0][1]["reply_parameters"]["message_id"] == 5
+    assert all(len(p["text"]) <= 4096 for _, p in sent)

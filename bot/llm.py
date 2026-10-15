@@ -15,7 +15,7 @@ import time
 import httpx
 
 from .config import CFG
-from .prompts import FACTCHECK_SYSTEM, SCORE_SYSTEM, WRITE_SYSTEM
+from .prompts import BRIEF_SYSTEM, FACTCHECK_SYSTEM, SCORE_SYSTEM, TRANSLATE_SYSTEM, WRITE_SYSTEM
 
 log = logging.getLogger(__name__)
 
@@ -397,3 +397,46 @@ CHECK_SCHEMA = {
 def fact_check(post_text: str, article_text: str) -> dict:
     user = f"ИСХОДНАЯ СТАТЬЯ:\n{article_text}\n\nРУССКИЙ ПОСТ:\n{post_text}"
     return _call(CFG.model_fast, FACTCHECK_SYSTEM, user, "fact_check", CHECK_SCHEMA, 3000)
+
+
+BRIEF_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "emoji": {"type": "string", "description": "Один эмодзи под тему"},
+        "headline": {"type": "string", "description": "Суть новости одной строкой по-русски"},
+        "place": {"type": "string", "description": "Город или провинция по-русски, например «Нячанг»; пусто, если неясно"},
+        "summary": {"type": "string", "description": "Что произошло: 2–3 предложения"},
+        "facts": {"type": "array", "items": {"type": "string"},
+                  "description": "3–7 коротких пунктов: кто (возраст, гражданство), где (адрес), когда (дата, время), что, чем закончилось"},
+        "numbers": {"type": "array", "items": {"type": "string"},
+                    "description": "Все цифры из статьи с пояснением: суммы, штрафы, сроки, количество; пусто, если цифр нет"},
+        "why": {"type": "string", "description": "Одна фраза: чем это зацепит русских во Вьетнаме"},
+    },
+    "required": ["emoji", "headline", "place", "summary", "facts", "numbers", "why"],
+}
+
+
+def brief(title: str, text: str, source: str, url: str, rates: str = "") -> dict:
+    """Выжимка новости на русском: суть, факты, цифры — для редактора, который пишет пост сам."""
+    user = f"Источник: {source} ({url})\nЗаголовок: {title}\n\nТекст статьи:\n{text}\n"
+    if rates:
+        user += f"\nКурс для пересчёта: {rates}\n"
+    result = _call([CFG.model_writer, CFG.model_fast], BRIEF_SYSTEM, user, "news_brief", BRIEF_SCHEMA, 6000)
+    for key in ("facts", "numbers"):
+        value = result.get(key) or []
+        result[key] = [str(v).strip() for v in (value if isinstance(value, list) else [value]) if str(v).strip()][:8]
+    return result
+
+
+TRANSLATE_SCHEMA = {
+    "type": "object",
+    "properties": {"translation": {"type": "string", "description": "Полный перевод статьи на русский"}},
+    "required": ["translation"],
+}
+
+
+def translate(text: str) -> str:
+    """Полный перевод статьи — по кнопке «Полный перевод». Сначала быстрая модель: у неё лимит больше."""
+    result = _call([CFG.model_fast, CFG.model_writer], TRANSLATE_SYSTEM, text[:12000], "translate",
+                   TRANSLATE_SCHEMA, 16000)
+    return str(result.get("translation", "")).strip()

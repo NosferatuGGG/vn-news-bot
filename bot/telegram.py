@@ -28,6 +28,49 @@ def build_post(data: dict, url: str, source: str) -> str:
     return "\n\n".join(parts)
 
 
+CATEGORY_RU = {
+    "russians": "русские", "crime": "криминал", "scam": "мошенники", "visa_law": "визы и законы",
+    "money": "деньги", "flights": "перелёты", "weather": "погода", "incident": "происшествие",
+    "viral": "курьёз", "other": "разное",
+}
+
+
+def build_card(data: dict, score: int, category: str, source: str, url: str, problems=None) -> str:
+    """Карточка новости для редактора: суть, факты, цифры, ссылка на оригинал."""
+    e = html.escape
+    head = " · ".join(x for x in (f"{score}/10", data.get("place", "").strip(), CATEGORY_RU.get(category, "")) if x)
+    parts = [f"{e(data.get('emoji', '📰'))} <b>{e(head)}</b>\n<b>{e(data['headline'].strip())}</b>",
+             f"<b>Суть:</b> {e(data['summary'].strip())}"]
+    if data.get("facts"):
+        parts.append("<b>Факты:</b>\n" + "\n".join(f"• {e(f)}" for f in data["facts"]))
+    if data.get("numbers"):
+        parts.append("<b>Цифры:</b>\n" + "\n".join(f"• {e(n)}" for n in data["numbers"]))
+    if data.get("why", "").strip():
+        parts.append(f"<b>Почему зайдёт:</b> {e(data['why'].strip())}")
+    if problems:
+        parts.append("⚠️ <i>Сверь с оригиналом: " + e("; ".join(problems)[:300]) + "</i>")
+    parts.append(f'🔗 <a href="{e(url, quote=True)}">Оригинал: {e(source)}</a>')
+    return "\n\n".join(parts)
+
+
+MARKS = {"published": "✅ <b>ОПУБЛИКОВАНО</b>", "skipped": "🚫 <b>Пропущено</b>"}
+
+
+def card_buttons(item_id: int, status: str) -> list:
+    if status == "published":
+        return [[{"text": "↩️ Снять отметку", "callback_data": f"unpub:{item_id}"},
+                 {"text": "📄 Полный перевод", "callback_data": f"full:{item_id}"}]]
+    if status == "skipped":
+        return [[{"text": "↩️ Вернуть", "callback_data": f"unpub:{item_id}"}]]
+    return [[{"text": "✅ Опубликовал", "callback_data": f"pub:{item_id}"}],
+            [{"text": "📄 Полный перевод", "callback_data": f"full:{item_id}"},
+             {"text": "🚫 Мимо", "callback_data": f"skip:{item_id}"}]]
+
+
+def marked(card: str, status: str) -> str:
+    return f"{MARKS[status]}\n\n{card}" if status in MARKS else card
+
+
 class TelegramError(RuntimeError):
     pass
 
@@ -62,6 +105,53 @@ class Telegram:
             link_preview_options={"is_disabled": False, "prefer_large_media": True}, **extra,
         )
         return res["message_id"]
+
+    def send_card(self, chat_id: str, text: str, image: str = "", buttons=None, silent=False) -> tuple:
+        """Карточка с фото: короткая — подписью к фото, длинная — текстом с превью фото сверху.
+        Возвращает (id сообщения, вид: photo | text)."""
+        extra = {"reply_markup": {"inline_keyboard": buttons}} if buttons else {}
+        if image and len(text) <= CAPTION_LIMIT:
+            try:
+                res = self._call("sendPhoto", chat_id=chat_id, photo=image, caption=text, parse_mode="HTML",
+                                 disable_notification=silent, **extra)
+                return res["message_id"], "photo"
+            except TelegramError as err:
+                log.warning("Фото не отправилось (%s), шлю текстом", err)
+        res = self._call("sendMessage", chat_id=chat_id, text=text[:TEXT_LIMIT], parse_mode="HTML",
+                         disable_notification=silent, link_preview_options=self._preview(image), **extra)
+        return res["message_id"], "text"
+
+    @staticmethod
+    def _preview(image: str) -> dict:
+        if image:
+            return {"url": image, "prefer_large_media": True, "show_above_text": True}
+        return {"is_disabled": True}
+
+    def edit_card(self, chat_id, message_id: int, kind: str, text: str, image: str = "", buttons=None):
+        markup = {"inline_keyboard": buttons or []}
+        if kind == "photo":
+            self._call("editMessageCaption", chat_id=chat_id, message_id=message_id, caption=text[:CAPTION_LIMIT],
+                       parse_mode="HTML", reply_markup=markup)
+        else:
+            self._call("editMessageText", chat_id=chat_id, message_id=message_id, text=text[:TEXT_LIMIT],
+                       parse_mode="HTML", link_preview_options=self._preview(image), reply_markup=markup)
+
+    def reply_long(self, chat_id, reply_to: int, title: str, text: str):
+        """Длинный текст (полный перевод) — несколькими сообщениями ответом на карточку."""
+        chunks, current = [], f"📄 Полный перевод: {title}\n\n"
+        paras = []
+        for para in text.split("\n"):
+            paras += [para[i:i + 3500] for i in range(0, len(para), 3500)] or [""]
+        for para in paras:
+            if len(current) + len(para) + 1 > 3900:
+                chunks.append(current)
+                current = ""
+            current += para + "\n"
+        chunks.append(current)
+        for i, chunk in enumerate(chunks):
+            extra = {"reply_parameters": {"message_id": reply_to, "allow_sending_without_reply": True}} if i == 0 else {}
+            self._call("sendMessage", chat_id=chat_id, text=chunk.strip(), disable_notification=True,
+                       link_preview_options={"is_disabled": True}, **extra)
 
     def call_text(self, chat_id: str, text: str):
         """Простое служебное сообщение без разметки."""

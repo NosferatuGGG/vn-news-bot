@@ -32,6 +32,11 @@ class Store:
         self.db = sqlite3.connect(path)
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
+        # новые колонки для старых баз
+        cols = {r[1] for r in self.db.execute("PRAGMA table_info(items)")}
+        if "card_kind" not in cols:
+            self.db.execute("ALTER TABLE items ADD COLUMN card_kind TEXT")
+            self.db.commit()
 
     @contextmanager
     def tx(self):
@@ -67,7 +72,7 @@ class Store:
     def recent_posted(self, hours: int = 72, limit: int = 40):
         since = time.time() - hours * 3600
         return self.db.execute(
-            "SELECT id, title_ru FROM items WHERE status IN ('posted','queued','review')"
+            "SELECT id, title_ru FROM items WHERE status IN ('posted','queued','review','sent','published','scored')"
             " AND fetched_at>? ORDER BY fetched_at DESC LIMIT ?",
             (since, limit),
         ).fetchall()
