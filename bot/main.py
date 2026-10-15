@@ -8,6 +8,7 @@
 import argparse
 import html
 import json
+import os
 import logging
 import time
 from datetime import datetime
@@ -223,7 +224,10 @@ def publish_from_queue(store: Store, tg: Telegram):
 # ---------- Кнопки модерации ----------
 def handle_updates(store: Store, tg: Telegram, timeout: int):
     offset = int(store.kv_get("tg_offset", 0))
-    for upd in tg.get_updates(offset, timeout):
+    updates = tg.get_updates(offset, timeout)
+    if updates:
+        log.info("Нажатий кнопок: %d", len(updates))
+    for upd in updates:
         try:
             _handle_one(store, tg, upd)
         finally:
@@ -283,10 +287,23 @@ def check_buttons(store: Store, tg: Telegram | None, timeout: int = 0):
         handle_updates(store, tg, timeout=timeout)
     except Exception as err:  # noqa: BLE001
         log.warning("Не удалось проверить кнопки: %s", err)
+        print(f"::warning title=Кнопки::{str(err)[:300]}", flush=True)
+
+
+def _notice(text: str):
+    if os.getenv("GITHUB_ACTIONS") == "true":
+        print(f"::notice title=Бот::{text}", flush=True)
 
 
 def run_once(store: Store, tg: Telegram):
     """Один проход — для запуска по расписанию (GitHub Actions, cron)."""
+    if not CFG.dry_run:
+        try:
+            info = tg.updates_info()
+            _notice(f"Telegram: ждут обработки {info.get('pending_update_count', '?')}, "
+                    f"принимаю {info.get('allowed_updates', 'всё')}, вебхук: {info.get('url') or 'нет'}")
+        except Exception as err:  # noqa: BLE001
+            _notice(f"Telegram не ответил на проверку: {str(err)[:200]}")
     check_buttons(store, tg)          # сначала нажатые тобой кнопки
     collect(store)
     # GitHub прерывает запуск через 15 минут — заканчиваем разбор заранее, чтобы успеть всё сохранить
@@ -294,6 +311,8 @@ def run_once(store: Store, tg: Telegram):
     check_buttons(store, tg)          # и те, что нажаты, пока шёл разбор
     publish_from_queue(store, tg)
     store.prune(days=CFG.keep_days)
+    counts = dict(store.db.execute("SELECT status, COUNT(*) FROM items GROUP BY status").fetchall())
+    _notice("Итог: " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
     if not llm_ok:
         # строка ::error:: видна прямо на странице запуска в GitHub; красный запуск = письмо на почту
         print("::error title=Бот не смог доработать::Нейросеть или Telegram не ответили. "

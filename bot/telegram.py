@@ -70,12 +70,25 @@ class Telegram:
     def get_updates(self, offset: int, timeout: int = 25) -> list:
         if CFG.dry_run:
             return []
-        r = self.http.get(
+        r = self.http.post(
             f"{self.base}/getUpdates",
-            params={"offset": offset, "timeout": timeout, "allowed_updates": json.dumps(["callback_query"])},
+            json={"offset": offset, "timeout": timeout, "allowed_updates": ["callback_query"]},
             timeout=timeout + 10,
         )
-        return r.json().get("result", [])
+        data = r.json()
+        if not data.get("ok"):
+            raise TelegramError(f"Telegram getUpdates: {data}")
+        return data.get("result", [])
+
+    def updates_info(self) -> dict:
+        """Сколько нажатий ждёт бота в Telegram и что он принимает — для журнала."""
+        if CFG.dry_run:
+            return {}
+        info = self._call("getWebhookInfo")
+        if info.get("url"):
+            # у бота включён вебхук — тогда нажатия не приходят в getUpdates; отключаем
+            self._call("deleteWebhook", drop_pending_updates=False)
+        return info
 
     def answer_callback(self, cb_id: str, text: str):
         self._call("answerCallbackQuery", callback_query_id=cb_id, text=text)

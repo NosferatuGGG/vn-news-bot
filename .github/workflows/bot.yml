@@ -6,6 +6,9 @@ on:
   schedule:
     - cron: "*/20 * * * *"     # каждые 20 минут (время UTC, для частоты это не важно)
   workflow_dispatch:            # кнопка «Run workflow» для ручного запуска
+  push:                         # и сразу после обновления кода бота
+    branches: [main]
+    paths: ["bot/**", ".github/workflows/**", "requirements.txt"]
 
 permissions:
   contents: write               # чтобы сохранять память бота в ветку state
