@@ -14,7 +14,7 @@ import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from . import llm
+from . import llm, money
 from .config import CFG
 from .fetch import fetch_article, fetch_source
 from .filters import prefilter
@@ -144,10 +144,11 @@ def send_briefs(store: Store, tg: Telegram | None, deadline: float | None):
         if len(art.text) < 200:
             store.update(row["id"], status="error", note="no text")
             continue
-        data = llm.brief(row["title"], art.text, row["source"], row["url"], rates=CFG.rates)
+        data = llm.brief(row["title"], art.text, row["source"], row["url"])
         plain = "\n".join([data["headline"], data["summary"], *data["facts"], *data["numbers"]])
         check = llm.fact_check(plain, art.text)
         problems = [] if check.get("ok") else check.get("problems", [])
+        data = money.annotate_brief(data, money.fetch_rates(store))   # «≈ $… ≈ … ₽» считает программа
         card = build_card(data, row["score"], row["category"] or "", row["source"], row["url"], problems)
         msg_id, kind = 0, "text"
         if tg and CFG.admin_chat_id:

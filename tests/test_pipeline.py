@@ -18,6 +18,8 @@ def _settings(monkeypatch):
     monkeypatch.setattr(CFG, "min_gap_min", 0)
     monkeypatch.setattr(CFG, "quiet_from", 0)
     monkeypatch.setattr(CFG, "quiet_to", 0)
+    from bot import money
+    monkeypatch.setattr(money, "fetch_rates", lambda store=None: {"usd_rub": 83.4839, "vnd_rub": 0.00325651})
 
 
 THANHNIEN_RSS = """<?xml version="1.0" encoding="UTF-8"?><rss version="2.0"><channel><title>Pháp luật</title>
@@ -93,7 +95,7 @@ def test_full_pipeline(tmp_path, monkeypatch):
     monkeypatch.setattr(llm, "score_batch", fake_batch)
     monkeypatch.setattr(llm, "brief", lambda *a, **k: {
         "emoji": "🚨", "headline": "Заголовок", "place": "Нячанг", "summary": "Суть", "facts": ["факт <1>"],
-        "numbers": ["6 000 млрд донгов"], "why": "рядом с нами"})
+        "numbers": ["оборот 6000 миллиардов донгов"], "why": "рядом с нами"})
     checks = iter([{"ok": False, "problems": ["лишняя цифра"]}, {"ok": True, "problems": []}])
     monkeypatch.setattr(llm, "fact_check", lambda *a: next(checks))
 
@@ -116,6 +118,7 @@ def test_full_pipeline(tmp_path, monkeypatch):
     assert "<b>Суть:</b> Суть" in cards[10] and "• факт &lt;1&gt;" in cards[10] and "Оригинал:" in cards[10]
     assert "Сверь с оригиналом: лишняя цифра" in cards[10]           # первой готовится самая интересная
     assert "Сверь" not in cards[9]
+    assert "• оборот 6 трлн донгов (≈ $234 млн ≈ 19,5 млрд ₽)" in cards[9]
 
 
 def test_daily_limit(tmp_path, monkeypatch):
