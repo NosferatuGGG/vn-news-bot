@@ -194,3 +194,20 @@ def test_batch_scoring_parses_every_item(monkeypatch):
     monkeypatch.setattr(llm, "EXHAUSTED", {})
     res = llm.score_batch([{"id": 5, "source": "s", "title": "x"}, {"id": 6, "source": "s", "title": "y"}], [])
     assert res[5]["score"] == 10 and res[6]["duplicate_of"] == 5
+
+
+def test_overloaded_model_falls_back_and_is_not_marked_exhausted(monkeypatch):
+    calls = []
+
+    def handler(req):
+        model = json.loads(req.content).get("model", "")
+        calls.append(model)
+        if model == CFG.model_fast:
+            return httpx.Response(503, json={"error": {"code": 503, "message": "This model is currently experiencing high demand."}})
+        return _compat_ok(SCORE)
+
+    _mock(monkeypatch, handler, "gemini")
+    monkeypatch.setattr(llm, "EXHAUSTED", {})
+    assert llm.score("t", "s", "x", "src", [])["score"] == 10
+    assert calls == [CFG.model_fast] * 3 + [CFG.model_writer]   # один способ, без перебора, потом запасная модель
+    assert CFG.model_fast not in llm.EXHAUSTED

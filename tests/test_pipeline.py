@@ -283,3 +283,17 @@ def test_card_layout_and_long_card_goes_as_text(monkeypatch):
     tg.reply_long("42", 5, "Новость", "\n".join(["абзац " * 100] * 20))
     assert len(sent) > 1 and sent[0][1]["reply_parameters"]["message_id"] == 5
     assert all(len(p["text"]) <= 4096 for _, p in sent)
+
+
+def test_google_overload_is_not_an_alarm_until_three_in_a_row(tmp_path, monkeypatch):
+    store = Store(str(tmp_path / "t.db"))
+    store.add_item("u1", "Báo Khánh Hòa", "Du khách Nga bị giật túi ở Nha Trang", "", time.time())
+
+    def busy(*a, **k):
+        raise llm.LLMBusyError("503 high demand")
+
+    monkeypatch.setattr(llm, "score_batch", busy)
+    results = [main.process(store, Telegram("x")) for _ in range(3)]
+    assert results == [True, True, False] and store.get(1)["status"] == "candidate"
+    monkeypatch.setattr(llm, "score_batch", lambda items, recent: {})
+    assert main.process(store, Telegram("x")) is True and store.kv_get("busy_streak") == "0"

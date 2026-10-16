@@ -40,6 +40,10 @@ class LLMError(RuntimeError):
     pass
 
 
+class LLMBusyError(LLMError):
+    """Сервера нейросети перегружены (503 «high demand») — это временно, попробуем в следующий запуск."""
+
+
 class LLMQuotaError(LLMError):
     """Кончился бесплатный лимит модели на сегодня (или время запуска вышло) — повторять бесполезно."""
 
@@ -107,6 +111,7 @@ def _extract_json(text: str) -> dict:
 
 
 def _post_with_retry(url: str, headers: dict, body: dict, attempts: int = 5, model: str = "") -> dict:
+    r = None
     for attempt in range(attempts):
         _throttle(model)
         try:
@@ -130,6 +135,8 @@ def _post_with_retry(url: str, headers: dict, body: dict, attempts: int = 5, mod
         if r.status_code >= 400:
             raise LLMError(f"{r.status_code}: {r.text[:500]}")
         return r.json()
+    if r is not None and r.status_code in (500, 502, 503, 529):
+        raise LLMBusyError(f"{model}: сервер перегружен ({r.status_code}) после {attempts} попыток")
     raise LLMError(f"нет ответа после {attempts} попыток")
 
 
@@ -227,8 +234,8 @@ def _call_gemini(model: str, system: str, user: str, name: str, schema: dict, ma
             else:
                 text = _gemini_interactions_text(data)
             result = _extract_json(text)
-        except LLMQuotaError:
-            raise  # лимит общий для всех способов — пробовать другие бессмысленно
+        except (LLMQuotaError, LLMBusyError):
+            raise  # лимит и перегрузка общие для всех способов — пробовать другие бессмысленно
         except (LLMError, ValueError, KeyError, IndexError, TypeError) as e:
             errors.append(f"{route}: {str(e)[:300]}")
             log.warning("Gemini, способ %s не сработал: %s", route, str(e)[:300])
@@ -266,6 +273,7 @@ def _call(models, system: str, user: str, name: str, schema: dict, max_tokens: i
     chain = [models] if isinstance(models, str) else [m for i, m in enumerate(models) if m and m not in models[:i]]
     today = quota_day()
     last_quota = None
+    busy = None
     for model in chain:
         if EXHAUSTED.get(model) == today:
             continue
@@ -277,6 +285,10 @@ def _call(models, system: str, user: str, name: str, schema: dict, max_tokens: i
                     return result
                 log.warning("В ответе модели нет полей %s, повторяю", missing)
             raise LLMError(f"Модель дважды вернула неполный ответ: {result}")
+        except LLMBusyError as e:
+            log.warning("Модель %s перегружена, пробую запасную", model)
+            busy = e
+            continue
         except LLMQuotaError as e:
             last_quota = e
             if "время" in str(e):
@@ -284,6 +296,8 @@ def _call(models, system: str, user: str, name: str, schema: dict, max_tokens: i
             log.warning("У модели %s кончился бесплатный лимит на сегодня", model)
             _annotate("warning", "Дневной лимит", f"{model}: {e}")
             EXHAUSTED[model] = today
+    if busy:
+        raise busy
     raise last_quota or LLMQuotaError("у всех моделей кончился дневной лимит")
 
 

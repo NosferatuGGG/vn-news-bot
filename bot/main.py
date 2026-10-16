@@ -173,10 +173,18 @@ def process(store: Store, tg: Telegram | None, deadline: float | None = None) ->
     try:
         score_candidates(store)
         send_briefs(store, tg, deadline)
+        store.kv_set("busy_streak", 0)
         return True
     except llm.LLMQuotaError as err:
         log.info("Нейросеть на паузе: %s. Продолжу в следующий запуск.", err)
         return True
+    except llm.LLMBusyError as err:
+        # у Google временная перегрузка — не ошибка бота; письмо шлём, только если так 3 запуска подряд
+        streak = int(store.kv_get("busy_streak", 0)) + 1
+        store.kv_set("busy_streak", streak)
+        log.warning("Нейросеть перегружена (%s), попробую в следующий запуск. Подряд: %d", err, streak)
+        print(f"::warning title=Нейросеть перегружена::{str(err)[:300]} (подряд: {streak})", flush=True)
+        return streak < 3
     except llm.LLMError as err:
         log.error("Нейросеть не ответила: %s", err)
         print(f"::error title=Нейросеть::{str(err)[:900]}", flush=True)
