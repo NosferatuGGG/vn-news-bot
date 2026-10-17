@@ -211,3 +211,9 @@ def test_overloaded_model_falls_back_and_is_not_marked_exhausted(monkeypatch):
     assert llm.score("t", "s", "x", "src", [])["score"] == 10
     assert calls == [CFG.model_fast] * 3 + [CFG.model_writer]   # один способ, без перебора, потом запасная модель
     assert CFG.model_fast not in llm.EXHAUSTED
+
+
+def test_broken_json_from_model_is_repaired():
+    assert llm._extract_json('{"items": [{"id": id=5, "score": 6, "duplicate_of": 0,}]}')["items"][0]["id"] == 5
+    assert llm._extract_json('```json\n{"items": [{"id": 7, "score": 3}\n```')["items"][0]["score"] == 3
+    assert llm._as_id("id=42") == 42 and llm._as_id(None) == 0

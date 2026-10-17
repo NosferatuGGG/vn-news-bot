@@ -98,16 +98,32 @@ def _parse_429(text: str) -> tuple[bool, float]:
 
 
 def _extract_json(text: str) -> dict:
+    """Достаём JSON из ответа модели. Модели иногда ошибаются в синтаксисе (лишняя запятая,
+    «id=123» вместо числа, оборванный хвост) — такие ответы чиним, а не выбрасываем."""
     text = text.strip()
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?|```$", "", text, flags=re.MULTILINE).strip()
     try:
         return json.loads(text)
+    except json.JSONDecodeError as err:
+        first_error = err
+    m = re.search(r"\{.*\}", text, re.DOTALL)
+    candidate = m.group(0) if m else text
+    candidate = re.sub(r'(:\s*)id\s*=\s*(\d+)', r"\1\2", candidate)   # "id": id=123 → "id": 123
+    try:
+        return json.loads(candidate)
     except json.JSONDecodeError:
-        m = re.search(r"\{.*\}", text, re.DOTALL)
-        if not m:
-            raise LLMError(f"Модель вернула не JSON: {text[:200]}")
-        return json.loads(m.group(0))
+        pass
+    try:
+        import json_repair
+        fixed = json_repair.loads(candidate)
+        if isinstance(fixed, dict) and fixed:
+            log.info("Ответ модели был с ошибкой в JSON — починил")
+            return fixed
+    except Exception:  # noqa: BLE001
+        pass
+    pos = first_error.pos
+    raise LLMError(f"Модель вернула битый JSON ({first_error.msg}): …{text[max(0, pos - 80):pos + 40]!r}…")
 
 
 def _post_with_retry(url: str, headers: dict, body: dict, attempts: int = 5, model: str = "") -> dict:
@@ -363,6 +379,12 @@ BATCH_SCHEMA = {
 }
 
 
+def _as_id(value) -> int:
+    """123, "123", "id=123" → 123; пусто → 0."""
+    digits = re.search(r"\d+", str(value or ""))
+    return int(digits.group(0)) if digits else 0
+
+
 def score_batch(items: list, recent: list) -> dict:
     """Оценить сразу пачку новостей одним запросом — так бесплатного лимита хватает на весь день.
     items: [{"id", "source", "title", "summary"}]. Возвращает {id: оценка}."""
@@ -370,7 +392,7 @@ def score_batch(items: list, recent: list) -> dict:
     lines = [f"id={it['id']} | {it['source']} | {it['title']}" + (f" — {it['summary'][:300]}" if it.get("summary") else "")
              for it in items]
     user = (
-        "Оцени каждую новость из списка. Верни оценку для КАЖДОГО id.\n"
+        "Оцени каждую новость из списка. Верни оценку для КАЖДОГО id (id — просто число, например 123).\n"
         "Если две новости из списка про одно и то же — у менее подробной укажи duplicate_of = id другой.\n\n"
         "НОВОСТИ:\n" + "\n".join(lines) +
         f"\n\nУже опубликовано или в очереди за последние дни:\n{recent_txt}"
@@ -380,8 +402,8 @@ def score_batch(items: list, recent: list) -> dict:
     for r in result.get("items", []):
         try:
             r["score"] = max(0, min(10, int(r.get("score", 0))))
-            r["duplicate_of"] = int(r.get("duplicate_of") or 0)
-            out[int(r["id"])] = r
+            r["duplicate_of"] = _as_id(r.get("duplicate_of"))
+            out[_as_id(r["id"])] = r
         except (TypeError, ValueError):
             continue
     return out

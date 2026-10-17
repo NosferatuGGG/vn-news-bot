@@ -5,3 +5,4 @@ trafilatura>=1.12
 beautifulsoup4>=4.12
 python-dotenv>=1.0
 pytest>=8.0
+json-repair>=0.30
