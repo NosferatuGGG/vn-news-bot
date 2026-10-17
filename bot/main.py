@@ -167,6 +167,12 @@ def process(store: Store, tg: Telegram | None, deadline: float | None = None) ->
         for row in store.by_status("review", limit=100) + store.by_status("queued", limit=100):
             store.update(row["id"], status="scored")
         store.kv_set("cards_v2", "1")
+    if store.kv_get("rescore_v1") != "1":
+        # оценки стали мягче — свежие отсеянные новости переоцениваем заново
+        with store.tx() as db:
+            db.execute("UPDATE items SET status='candidate' WHERE status='low' AND fetched_at>?",
+                       (time.time() - 30 * 3600,))
+        store.kv_set("rescore_v1", "1")
     prefilter_queue(store)
     _load_quota_state(store)
     llm.DEADLINE = deadline
