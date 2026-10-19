@@ -117,8 +117,15 @@ class Telegram:
                 return res["message_id"], "photo"
             except TelegramError as err:
                 log.warning("Фото не отправилось (%s), шлю текстом", err)
-        res = self._call("sendMessage", chat_id=chat_id, text=text[:TEXT_LIMIT], parse_mode="HTML",
-                         disable_notification=silent, link_preview_options=self._preview(image), **extra)
+        try:
+            res = self._call("sendMessage", chat_id=chat_id, text=text[:TEXT_LIMIT], parse_mode="HTML",
+                             disable_notification=silent, link_preview_options=self._preview(image), **extra)
+        except TelegramError as err:
+            if not image:
+                raise
+            log.warning("Telegram не принял картинку (%s), шлю без неё", err)
+            res = self._call("sendMessage", chat_id=chat_id, text=text[:TEXT_LIMIT], parse_mode="HTML",
+                             disable_notification=silent, link_preview_options=self._preview(""), **extra)
         return res["message_id"], "text"
 
     @staticmethod
@@ -133,8 +140,14 @@ class Telegram:
             self._call("editMessageCaption", chat_id=chat_id, message_id=message_id, caption=text[:CAPTION_LIMIT],
                        parse_mode="HTML", reply_markup=markup)
         else:
-            self._call("editMessageText", chat_id=chat_id, message_id=message_id, text=text[:TEXT_LIMIT],
-                       parse_mode="HTML", link_preview_options=self._preview(image), reply_markup=markup)
+            try:
+                self._call("editMessageText", chat_id=chat_id, message_id=message_id, text=text[:TEXT_LIMIT],
+                           parse_mode="HTML", link_preview_options=self._preview(image), reply_markup=markup)
+            except TelegramError:
+                if not image:
+                    raise
+                self._call("editMessageText", chat_id=chat_id, message_id=message_id, text=text[:TEXT_LIMIT],
+                           parse_mode="HTML", link_preview_options=self._preview(""), reply_markup=markup)
 
     def reply_long(self, chat_id, reply_to: int, title: str, text: str):
         """Длинный текст (полный перевод) — несколькими сообщениями ответом на карточку."""

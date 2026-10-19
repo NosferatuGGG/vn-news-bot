@@ -9,7 +9,7 @@ from bot import fetch, llm, main  # noqa: E402
 from bot.config import CFG  # noqa: E402
 from bot.fetch import Article, Entry, parse_listing, parse_rss  # noqa: E402
 from bot.store import Store  # noqa: E402
-from bot.telegram import Telegram, build_post  # noqa: E402
+from bot.telegram import Telegram, TelegramError, build_post  # noqa: E402
 
 @pytest.fixture(autouse=True)
 def _settings(monkeypatch):
@@ -297,3 +297,26 @@ def test_google_overload_is_not_an_alarm_until_three_in_a_row(tmp_path, monkeypa
     assert results == [True, True, False] and store.get(1)["status"] == "candidate"
     monkeypatch.setattr(llm, "score_batch", lambda items, recent: {})
     assert main.process(store, Telegram("x")) is True and store.kv_get("busy_streak") == "0"
+
+
+def test_image_urls_are_cleaned():
+    from bot.fetch import clean_image_url
+    page = "https://tuoitre.vn/a/b.htm"
+    assert clean_image_url("/img/x.jpg", page) == "https://tuoitre.vn/img/x.jpg"
+    assert clean_image_url("https://cdn.vn/a b.jpg", page) == "https://cdn.vn/a%20b.jpg"
+    assert clean_image_url("", page) == ""
+
+
+def test_card_with_bad_preview_is_resent_without_picture(monkeypatch):
+    tg = Telegram("x")
+    sent = []
+
+    def fake_call(method, **kw):
+        sent.append(kw["link_preview_options"])
+        if kw["link_preview_options"].get("url"):
+            raise TelegramError("Telegram sendMessage: {'error_code': 400, 'description': 'Bad Request: WEBPAGE_URL_INVALID'}")
+        return {"message_id": 5}
+
+    monkeypatch.setattr(tg, "_call", fake_call)
+    assert tg.send_card("1", "x" * 2000, "https://bad/img.jpg") == (5, "text")
+    assert sent[-1] == {"is_disabled": True}

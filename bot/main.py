@@ -152,8 +152,17 @@ def send_briefs(store: Store, tg: Telegram | None, deadline: float | None):
         card = build_card(data, row["score"], row["category"] or "", row["source"], row["url"], problems)
         msg_id, kind = 0, "text"
         if tg and CFG.admin_chat_id:
-            msg_id, kind = tg.send_card(CFG.admin_chat_id, card, art.image, card_buttons(row["id"], "sent"),
-                                        silent=row["score"] < CFG.loud_score or is_quiet_time())
+            try:
+                msg_id, kind = tg.send_card(CFG.admin_chat_id, card, art.image, card_buttons(row["id"], "sent"),
+                                            silent=row["score"] < CFG.loud_score or is_quiet_time())
+            except TelegramError as err:
+                if "400" not in str(err):
+                    raise   # Telegram недоступен целиком — это настоящий сбой
+                # Telegram не принял именно эту карточку — пропускаем её, чтобы она не застопорила остальные
+                log.warning("Telegram не принял карточку %s: %s", row["url"], err)
+                print(f"::warning title=Карточка не отправилась::{row['url']} — {str(err)[:200]}", flush=True)
+                store.update(row["id"], status="error", note=f"telegram: {str(err)[:250]}")
+                continue
         # статус меняем только после успешной отправки — иначе карточка потеряется
         store.update(row["id"], status="sent", post_html=card, image=art.image, tg_message_id=msg_id,
                      card_kind=kind, title_ru=data["headline"])

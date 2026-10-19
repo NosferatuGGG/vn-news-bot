@@ -95,6 +95,15 @@ class Article:
     published_at: float | None
 
 
+def clean_image_url(src: str, page_url: str) -> str:
+    """Ссылка на картинку должна быть полной и без пробелов — иначе Telegram отказывается показывать превью."""
+    if not (src or "").strip():
+        return ""
+    src = urljoin(page_url, src.strip())
+    src = src.replace(" ", "%20")
+    return src if re.match(r"^https?://[^\s/]+\.[^\s/]+/", src) else ""
+
+
 def fetch_article(url: str) -> Article:
     html = get(url)
     text = trafilatura.extract(html, include_comments=False, include_tables=False) or ""
@@ -102,7 +111,7 @@ def fetch_article(url: str) -> Article:
     img = ""
     m = soup.find("meta", property="og:image") or soup.find("meta", attrs={"name": "og:image"})
     if m and m.get("content"):
-        img = m["content"]
+        img = clean_image_url(m["content"], url)
     published = None
     t = soup.find("meta", property="article:published_time")
     if t and t.get("content"):
