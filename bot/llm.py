@@ -135,6 +135,10 @@ def _post_with_retry(url: str, headers: dict, body: dict, attempts: int = 5, mod
         except httpx.TimeoutException:
             log.warning("Нейросеть не ответила вовремя, повторяю")
             continue
+        except httpx.TransportError as err:   # обрыв связи, «сервер закрыл соединение» и т. п.
+            log.warning("Связь с нейросетью оборвалась (%s), повторяю", err)
+            _sleep(min(5 * (attempt + 1), 20))
+            continue
         if r.status_code == 429 and CFG.llm_provider == "gemini":
             daily, retry = _parse_429(r.text)
             if daily:

@@ -2,6 +2,7 @@
 import html
 import json
 import logging
+import time
 
 import httpx
 
@@ -85,8 +86,21 @@ class Telegram:
             log.info("[DRY RUN] %s %s", method, {k: v for k, v in params.items() if k != "reply_markup"})
             print(f"\n===== {method} → {params.get('chat_id')} =====\n{params.get('caption') or params.get('text')}\n")
             return {"message_id": 0}
-        r = self.http.post(f"{self.base}/{method}", json=params)
-        data = r.json()
+        data = None
+        for attempt in range(3):   # короткие обрывы связи с Telegram переживаем повтором
+            try:
+                r = self.http.post(f"{self.base}/{method}", json=params)
+                data = r.json()
+            except (httpx.TransportError, ValueError) as err:
+                log.warning("Telegram %s: связь оборвалась (%s), повторяю", method, err)
+                data = {"ok": False, "description": f"нет связи: {err}"}
+                time.sleep(3 * (attempt + 1))
+                continue
+            if data.get("error_code") in (429, 500, 502, 503, 504):
+                wait = (data.get("parameters") or {}).get("retry_after") or 3 * (attempt + 1)
+                time.sleep(min(wait, 30))
+                continue
+            break
         if not data.get("ok"):
             raise TelegramError(f"Telegram {method}: {data}")
         return data["result"]
