@@ -11,6 +11,7 @@ import json
 import os
 import logging
 import time
+import traceback
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -144,12 +145,23 @@ def send_briefs(store: Store, tg: Telegram | None, deadline: float | None):
         if len(art.text) < 200:
             store.update(row["id"], status="error", note="no text")
             continue
-        data = llm.brief(row["title"], art.text, row["source"], row["url"])
-        plain = "\n".join([data["headline"], data["summary"], *data["facts"], *data["numbers"]])
-        check = llm.fact_check(plain, art.text)
-        problems = [] if check.get("ok") else check.get("problems", [])
-        data = money.annotate_brief(data, money.fetch_rates(store))   # «≈ $… ≈ … ₽» считает программа
-        card = build_card(data, row["score"], row["category"] or "", row["source"], row["url"], problems)
+        try:
+            data = llm.brief(row["title"], art.text, row["source"], row["url"])
+            plain = "\n".join([data["headline"], data["summary"], *data["facts"], *data["numbers"]])
+            check = llm.fact_check(plain, art.text)
+            problems = [] if check.get("ok") else [str(p) for p in check.get("problems") or []]
+            data = money.annotate_brief(data, money.fetch_rates(store))   # «≈ $… ≈ … ₽» считает программа
+            card = build_card(data, row["score"], row["category"] or "", row["source"], row["url"], problems)
+        except llm.LLMError:
+            raise   # лимит, перегрузка, сбой нейросети — разбираются выше
+        except Exception as err:  # noqa: BLE001
+            # что-то необычное в этой конкретной новости — пропускаем её, чтобы она не стопорила остальные
+            where = traceback.extract_tb(err.__traceback__)[-1]
+            msg = f"{type(err).__name__}: {err} ({os.path.basename(where.filename)}:{where.lineno})"
+            log.warning("Не получилась карточка %s: %s", row["url"], msg)
+            print(f"::warning title=Карточка не получилась::{row['url']} — {msg[:300]}", flush=True)
+            store.update(row["id"], status="error", note=msg[:300])
+            continue
         msg_id, kind = 0, "text"
         if tg and CFG.admin_chat_id:
             try:
@@ -402,7 +414,16 @@ def main():
     store = Store(CFG.db_path)
     tg = Telegram(CFG.telegram_token)
     if args.once:
-        run_once(store, tg)
+        try:
+            run_once(store, tg)
+        except SystemExit:
+            raise
+        except Exception as err:  # noqa: BLE001
+            # причина падения — прямо на странице запуска и в письме, без чтения журнала
+            tb = traceback.extract_tb(err.__traceback__)
+            where = " ← ".join(f"{os.path.basename(f.filename)}:{f.lineno} {f.name}" for f in reversed(tb[-4:]))
+            print(f"::error title=Бот упал::{type(err).__name__}: {str(err)[:300]} | {where}", flush=True)
+            raise
     else:
         log.info("Старт. Режим: %s, источников: %d", CFG.mode, len(SOURCES))
         run_forever(store, tg)

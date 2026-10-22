@@ -461,6 +461,9 @@ def brief(title: str, text: str, source: str, url: str, rates: str = "") -> dict
     for key in ("facts", "numbers"):
         value = result.get(key) or []
         result[key] = [str(v).strip() for v in (value if isinstance(value, list) else [value]) if str(v).strip()][:8]
+    for key in ("emoji", "headline", "place", "summary", "why"):
+        value = result.get(key)
+        result[key] = "" if value is None else str(value).strip()
     return result
 
 
