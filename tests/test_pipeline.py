@@ -18,6 +18,7 @@ def _settings(monkeypatch):
     monkeypatch.setattr(CFG, "min_gap_min", 0)
     monkeypatch.setattr(CFG, "quiet_from", 0)
     monkeypatch.setattr(CFG, "quiet_to", 0)
+    monkeypatch.setattr(CFG, "output", "briefs")   # старые тесты — про выжимки; посты проверяет test_posts.py
     from bot import money
     monkeypatch.setattr(money, "fetch_rates", lambda store=None: {"usd_rub": 83.4839, "vnd_rub": 0.00325651})
 

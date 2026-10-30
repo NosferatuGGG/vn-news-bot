@@ -15,7 +15,7 @@ import time
 import httpx
 
 from .config import CFG
-from .prompts import BRIEF_SYSTEM, FACTCHECK_SYSTEM, SCORE_SYSTEM, TRANSLATE_SYSTEM, WRITE_SYSTEM
+from .prompts import BRIEF_SYSTEM, FACTCHECK_SYSTEM, POST_SYSTEM, SCORE_SYSTEM, TRANSLATE_SYSTEM, WRITE_SYSTEM
 
 log = logging.getLogger(__name__)
 
@@ -374,8 +374,9 @@ BATCH_SCHEMA = {
                     "title_ru": {"type": "string", "description": "Суть новости по-русски, одна строка"},
                     "duplicate_of": {"type": "integer", "description": "id такой же истории (из списка уже опубликованных или из этой же пачки), иначе 0"},
                     "reason": {"type": "string", "description": "Почему такая оценка, коротко"},
+                    "heavy": {"type": "boolean", "description": "Погибшие, насилие, убийство, пострадавшие дети, самоубийство"},
                 },
-                "required": ["id", "score", "category", "title_ru", "duplicate_of", "reason"],
+                "required": ["id", "score", "category", "title_ru", "duplicate_of", "reason", "heavy"],
             },
         },
     },
@@ -407,6 +408,7 @@ def score_batch(items: list, recent: list) -> dict:
         try:
             r["score"] = max(0, min(10, int(r.get("score", 0))))
             r["duplicate_of"] = _as_id(r.get("duplicate_of"))
+            r["heavy"] = str(r.get("heavy", "")).strip().lower() in ("true", "1", "yes", "да")
             out[_as_id(r["id"])] = r
         except (TypeError, ValueError):
             continue
@@ -424,6 +426,43 @@ def write_post(title: str, text: str, source: str, url: str, fix_notes: str = ""
     return result
 
 
+POST_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "emoji": {"type": "string", "description": "Один эмодзи под тему; пусто для тяжёлых новостей"},
+        "headline": {"type": "string", "description": "Заголовок одной строкой, без эмодзи"},
+        "paragraphs": {"type": "array", "items": {"type": "string"},
+                       "description": "2–5 абзацев поста; жирное выделение — **так**"},
+    },
+    "required": ["emoji", "headline", "paragraphs"],
+}
+
+
+def articles_text(articles: list) -> str:
+    """Несколько статей одной истории — одним текстом для нейросети."""
+    per = max(2500, 9000 // max(1, len(articles)))
+    return "\n\n".join(f"=== СТАТЬЯ {i}: {a['source']} ({a['url']}) ===\n{a['title']}\n\n{a['text'][:per]}"
+                       for i, a in enumerate(articles, 1))
+
+
+def write_channel_post(articles: list, fix_notes: str = "") -> dict:
+    """Готовый пост для канала по одной или нескольким статьям об одной истории.
+    articles: [{"source", "url", "title", "text"}]."""
+    user = articles_text(articles)
+    if fix_notes:
+        user += ("\n\nПрошлый вариант поста не прошёл проверку. Перепиши и исправь всё это "
+                 f"(цифру, которой нет в статьях, убери или замени словами):\n{fix_notes}\n")
+    result = _call([CFG.model_writer, CFG.model_fast], POST_SYSTEM, user, "channel_post", POST_SCHEMA, 6000)
+    paras = result.get("paragraphs") or []
+    if isinstance(paras, str):
+        paras = paras.split("\n\n")
+    result["paragraphs"] = [str(p).strip() for p in paras if str(p).strip()][:6]
+    for key in ("emoji", "headline"):
+        value = result.get(key)
+        result[key] = "" if value is None else str(value).strip()
+    return result
+
+
 CHECK_SCHEMA = {
     "type": "object",
     "properties": {
@@ -435,7 +474,7 @@ CHECK_SCHEMA = {
 
 
 def fact_check(post_text: str, article_text: str) -> dict:
-    user = f"ИСХОДНАЯ СТАТЬЯ:\n{article_text}\n\nРУССКИЙ ПОСТ:\n{post_text}"
+    user = f"ИСХОДНЫЕ СТАТЬИ:\n{article_text}\n\nРУССКИЙ ПОСТ:\n{post_text}"
     return _call(CFG.model_fast, FACTCHECK_SYSTEM, user, "fact_check", CHECK_SCHEMA, 3000)
 
 

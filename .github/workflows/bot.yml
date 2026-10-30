@@ -54,6 +54,11 @@ jobs:
           MODEL_FAST: ${{ vars.MODEL_FAST }}
           MODEL_WRITER: ${{ vars.MODEL_WRITER }}
           MODE: ${{ vars.MODE }}
+          OUTPUT: ${{ vars.OUTPUT }}
+          AUTOPUBLISH: ${{ vars.AUTOPUBLISH }}
+          HOLD_HEAVY_HOURS: ${{ vars.HOLD_HEAVY_HOURS }}
+          SUBSCRIBE_TEXT: ${{ vars.SUBSCRIBE_TEXT }}
+          SUBSCRIBE_URL: ${{ vars.SUBSCRIBE_URL }}
           MIN_SCORE: ${{ vars.MIN_SCORE }}
           MAX_POSTS_PER_DAY: ${{ vars.MAX_POSTS_PER_DAY }}
           MIN_GAP_MIN: ${{ vars.MIN_GAP_MIN }}

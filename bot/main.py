@@ -15,13 +15,14 @@ import traceback
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from . import llm, money
+from . import llm, money, verify
 from .config import CFG
 from .fetch import fetch_article, fetch_source
 from .filters import prefilter
 from .sources import SOURCES
 from .store import Store
-from .telegram import Telegram, TelegramError, build_card, build_post, card_buttons, marked
+from .telegram import (CAPTION_LIMIT, Telegram, TelegramError, build_card, build_channel_post, build_post,
+                       build_post_card, card_buttons, marked, post_buttons, visible_len)
 
 log = logging.getLogger("bot")
 
@@ -110,10 +111,10 @@ def score_candidates(store: Store):
         if not sc:
             continue  # модель пропустила — оценим в следующий раз
         fields = dict(score=sc["score"], category=sc.get("category", "other"), title_ru=sc.get("title_ru", ""),
-                      note=str(sc.get("reason", ""))[:300])
-        if sc["duplicate_of"] and sc["duplicate_of"] != row["id"]:
+                      note=str(sc.get("reason", ""))[:300], heavy=1 if sc.get("heavy") else 0)
+        if sc["duplicate_of"] and sc["duplicate_of"] != row["id"] and store.get(sc["duplicate_of"]):
             log.info("  [дубль] %s", fields["title_ru"])
-            store.update(row["id"], status="duplicate", **fields)
+            store.update(row["id"], status="duplicate", dup_of=sc["duplicate_of"], **fields)
         elif sc["score"] < CFG.min_score:
             log.info("  [%s/10 — мимо] %s", sc["score"], fields["title_ru"])
             store.update(row["id"], status="low", **fields)
@@ -181,6 +182,118 @@ def send_briefs(store: Store, tg: Telegram | None, deadline: float | None):
         log.info("  [%s/10 — ПРИСЛАЛ] %s (%.0f с)", row["score"], data["headline"], time.time() - started)
 
 
+# ---------- 3–4. Готовый пост: несколько изданий, проверка цифр кодом и редактором ----------
+def _check_post(data: dict, src_text: str) -> list:
+    plain = "\n".join([data["headline"], *data["paragraphs"]])
+    if not data["paragraphs"]:
+        return ["нейросеть вернула пустой пост"]
+    problems = verify.check_numbers(plain, src_text)          # бесплатно и без ошибок нейросети
+    check = llm.fact_check(plain, src_text)                    # додуманные детали, «нож» вместо «оружия» и т. п.
+    if not check.get("ok"):
+        problems += [str(p) for p in check.get("problems") or [] if str(p).strip()] or ["редактор нашёл неточность"]
+    return problems
+
+
+def make_channel_post(articles: list, heavy: bool, rates: dict) -> tuple[str, list, str]:
+    """Пишет пост, проверяет, при ошибках переписывает один раз. Возвращает (HTML поста, проблемы, пометка)."""
+    src_text = llm.articles_text(articles)
+    data = llm.write_channel_post(articles)
+    problems = _check_post(data, src_text)
+    if problems:
+        log.info("Проверка нашла проблемы, переписываю: %s", problems)
+        data = llm.write_channel_post(articles, fix_notes="\n".join(f"- {p}" for p in problems))
+        problems = _check_post(data, src_text)
+    data["headline"] = money.annotate(data["headline"], rates)
+    data["paragraphs"] = [money.annotate(p, rates) for p in data["paragraphs"]]   # «≈ $… ≈ … ₽» считает программа
+    post = build_channel_post(data)
+    if heavy and len(articles) < 2:
+        problems.append("тяжёлая тема, а написало об этом только одно издание")
+    notes = [f"сверено по {len(articles)} изданиям" if len(articles) > 1 else "одно издание"]
+    if visible_len(post) > CAPTION_LIMIT:
+        notes.append("длинный — уйдёт текстом с картинкой сверху, а не подписью к фото")
+    return post, problems, "; ".join(notes)
+
+
+def _ready(store: Store, row) -> bool:
+    """Тяжёлая новость ждёт второе издание несколько часов; остальные — сразу."""
+    if not row["heavy"] or store.companions(row["id"]):
+        return True
+    return time.time() - (row["fetched_at"] or 0) > CFG.hold_heavy_hours * 3600
+
+
+def _article(art, row) -> dict:
+    return {"source": row["source"], "url": row["url"], "title": row["title"], "text": art.text}
+
+
+def write_posts(store: Store, tg: Telegram | None, deadline: float | None):
+    """Шаг 2: самые интересные из оценённых — готовый пост. Проверенный в авто-режиме идёт в очередь канала,
+    остальное — вам карточкой с кнопкой «Опубликовать»."""
+    pool = store.by_status("scored", limit=60, order="score DESC, published_at DESC")
+    todo = [r for r in pool if _ready(store, r)][:CFG.max_writes_per_run]
+    rates = money.fetch_rates(store)
+    for row in todo:
+        if deadline and time.time() > deadline:
+            log.info("Время запуска вышло — остальное в следующий раз")
+            return
+        check_buttons(store, tg)
+        started = time.time()
+        try:
+            art = fetch_article(row["url"])
+        except Exception as err:  # noqa: BLE001
+            log.warning("Не открылась статья %s: %s", row["url"], err)
+            store.update(row["id"], status="error", note=str(err)[:300])
+            continue
+        if art.published_at:
+            store.update(row["id"], published_at=art.published_at)
+            if art.published_at < time.time() - CFG.max_age_hours * 3600:
+                store.update(row["id"], status="filtered", note="old")
+                continue
+        if len(art.text) < 200:
+            store.update(row["id"], status="error", note="no text")
+            continue
+        articles, image = [_article(art, row)], art.image
+        for comp in store.companions(row["id"])[:2]:   # та же история в других изданиях
+            try:
+                extra = fetch_article(comp["url"])
+            except Exception as err:  # noqa: BLE001
+                log.info("Второе издание не открылось %s: %s", comp["url"], err)
+                continue
+            if len(extra.text) >= 200:
+                articles.append(_article(extra, comp))
+                image = image or extra.image
+        try:
+            post, problems, note = make_channel_post(articles, bool(row["heavy"]), rates)
+        except llm.LLMError:
+            raise
+        except Exception as err:  # noqa: BLE001
+            where = traceback.extract_tb(err.__traceback__)[-1]
+            msg = f"{type(err).__name__}: {err} ({os.path.basename(where.filename)}:{where.lineno})"
+            log.warning("Не получился пост %s: %s", row["url"], msg)
+            print(f"::warning title=Пост не получился::{row['url']} — {msg[:300]}", flush=True)
+            store.update(row["id"], status="error", note=msg[:300])
+            continue
+        if CFG.autopublish and not problems:
+            store.update(row["id"], status="queued", post_html=post, image=image, note=note)
+            log.info("  [%s/10 — В ОЧЕРЕДЬ] %s (%.0f с)", row["score"], row["title_ru"], time.time() - started)
+            continue
+        card = build_post_card(post, row["score"], row["category"] or "", articles, problems, note)
+        msg_id, kind = 0, "text"
+        if tg and CFG.admin_chat_id:
+            try:
+                msg_id, kind = tg.send_card(CFG.admin_chat_id, card, image, post_buttons(row["id"], "sent"),
+                                            silent=row["score"] < CFG.loud_score or is_quiet_time())
+            except TelegramError as err:
+                if "400" not in str(err):
+                    raise
+                log.warning("Telegram не принял карточку %s: %s", row["url"], err)
+                store.update(row["id"], status="error", note=f"telegram: {str(err)[:250]}")
+                continue
+        store.update(row["id"], status="sent", post_html=post, card_html=card, image=image, tg_message_id=msg_id,
+                     card_kind=kind, note="; ".join(problems)[:300] or note)
+        log.info("  [%s/10 — ПРИСЛАЛ%s] %s (%.0f с)", row["score"], " С ПОМЕТКОЙ" if problems else "",
+                 row["title_ru"], time.time() - started)
+
+
 def process(store: Store, tg: Telegram | None, deadline: float | None = None) -> bool:
     """Возвращает False только при настоящем сбое (не при дневном лимите — он обнуляется сам)."""
     if store.kv_get("cards_v2") != "1":
@@ -199,7 +312,10 @@ def process(store: Store, tg: Telegram | None, deadline: float | None = None) ->
     llm.DEADLINE = deadline
     try:
         score_candidates(store)
-        send_briefs(store, tg, deadline)
+        if CFG.output == "briefs":
+            send_briefs(store, tg, deadline)
+        else:
+            write_posts(store, tg, deadline)
         store.kv_set("busy_streak", 0)
         return True
     except llm.LLMQuotaError as err:
@@ -297,11 +413,30 @@ def _handle_one(store: Store, tg: Telegram, upd: dict):
         except Exception as err:  # noqa: BLE001 — нажатие обработано позже, Telegram уже не ждёт ответа
             log.info("Telegram не принял ответ на кнопку: %s", err)
 
-    if not row or action not in (*ACTIONS, "full"):
+    if not row or action not in (*ACTIONS, "full", "go", "back"):
         toast("Эта кнопка от старой версии бота")
         return
+    is_post = bool(row["card_html"])   # карточка с готовым постом (а не выжимка фактов)
+
+    def redraw(status):
+        kind = row["card_kind"] or ("photo" if "photo" in msg else "text")
+        tg.edit_card(chat_id, message_id, kind, marked(row["card_html"], status), row["image"] or "",
+                     post_buttons(row["id"], status))
+
     try:
-        if action in ACTIONS:
+        if action == "go":
+            if row["status"] == "posted":
+                toast("Уже в канале")
+                return
+            publish(store, tg, row["id"])
+            redraw("posted")
+            toast("Опубликовано в канале")
+        elif is_post and action in ("skip", "back", "unpub"):
+            status = "skipped" if action == "skip" else "sent"
+            store.update(row["id"], status=status)
+            redraw(status)
+            toast("Пропущено" if status == "skipped" else "Вернул")
+        elif action in ACTIONS:
             status = ACTIONS[action]
             store.update(row["id"], status=status)
             if row["post_html"]:
@@ -359,6 +494,13 @@ def run_once(store: Store, tg: Telegram):
     # GitHub прерывает запуск через 15 минут — заканчиваем разбор заранее, чтобы успеть всё сохранить
     llm_ok = process(store, tg, deadline=time.time() + CFG.run_budget_min * 60)
     check_buttons(store, tg)          # и те, что нажаты, пока шёл разбор
+    if CFG.autopublish and not CFG.dry_run:
+        try:
+            publish_from_queue(store, tg)   # проверенные посты — в канал по расписанию
+        except TelegramError as err:
+            log.error("Не смог опубликовать из очереди: %s", err)
+            print(f"::error title=Публикация::{str(err)[:500]}", flush=True)
+            llm_ok = False
     store.prune(days=CFG.keep_days)
     counts = dict(store.db.execute("SELECT status, COUNT(*) FROM items GROUP BY status").fetchall())
     _notice("Итог: " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
@@ -378,7 +520,9 @@ def run_forever(store: Store, tg: Telegram):
                 process(store, tg)
                 next_scan = time.time() + CFG.scan_interval_min * 60
                 store.prune(days=CFG.keep_days)
-            if CFG.mode == "moderate" and not CFG.dry_run:
+            if CFG.autopublish and not CFG.dry_run:
+                publish_from_queue(store, tg)
+            if CFG.admin_chat_id and not CFG.dry_run:
                 handle_updates(store, tg, timeout=25)
             else:
                 time.sleep(30)
@@ -394,9 +538,11 @@ def test_url(url: str):
     print(f"Текст статьи: {len(art.text)} знаков, картинка: {art.image or 'нет'}\n")
     sc = llm.score("", "", art.text, url.split('/')[2], [])
     print("ОЦЕНКА:", sc, "\n")
-    post, problems = make_post("", art.text, url.split('/')[2], url)
+    articles = [{"source": url.split('/')[2], "url": url, "title": "", "text": art.text}]
+    post, problems, note = make_channel_post(articles, bool(sc.get("heavy")), money.fetch_rates())
     print(post)
-    print("\nФактчек:", "OK" if not problems else problems)
+    print(f"\n{visible_len(post)}/1024 знаков; {note}")
+    print("Проверка:", "OK" if not problems else problems)
 
 
 def main():

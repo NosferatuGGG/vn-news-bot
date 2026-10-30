@@ -34,9 +34,10 @@ class Store:
         self.db.executescript(SCHEMA)
         # новые колонки для старых баз
         cols = {r[1] for r in self.db.execute("PRAGMA table_info(items)")}
-        if "card_kind" not in cols:
-            self.db.execute("ALTER TABLE items ADD COLUMN card_kind TEXT")
-            self.db.commit()
+        for col, kind in (("card_kind", "TEXT"), ("dup_of", "INTEGER"), ("heavy", "INTEGER"), ("card_html", "TEXT")):
+            if col not in cols:
+                self.db.execute(f"ALTER TABLE items ADD COLUMN {col} {kind}")
+        self.db.commit()
 
     @contextmanager
     def tx(self):
@@ -75,6 +76,15 @@ class Store:
             "SELECT id, title_ru FROM items WHERE status IN ('posted','queued','review','sent','published','scored')"
             " AND fetched_at>? ORDER BY fetched_at DESC LIMIT ?",
             (since, limit),
+        ).fetchall()
+
+    def companions(self, item_id: int) -> list:
+        """Та же история в других изданиях: дубли этой новости и та, дублем которой она отмечена."""
+        row = self.get(item_id)
+        root = row["dup_of"] or item_id if row else item_id
+        return self.db.execute(
+            "SELECT * FROM items WHERE (dup_of=? OR id=?) AND id!=? ORDER BY published_at",
+            (root, root, item_id),
         ).fetchall()
 
     def posted_since(self, ts: float) -> int:

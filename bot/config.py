@@ -54,6 +54,13 @@ class Config:
     # --- Режим работы ---
     # moderate — сначала черновик тебе в личку с кнопками; auto — сразу в канал
     mode: str = _env("MODE", "moderate")
+    # posts — бот пишет готовые посты для канала; briefs — только выжимки фактов для редактора
+    output: str = _env("OUTPUT", "posts")
+    # 1 — проверенные посты сами уходят в канал по расписанию; 0 — каждый пост ждёт вашей кнопки «Опубликовать».
+    # Посты, не прошедшие проверку, приходят вам в любом случае.
+    autopublish: bool = _bool("AUTOPUBLISH", False)
+    # тяжёлые новости (погибшие, насилие) ждут второе издание столько часов, прежде чем идти без него
+    hold_heavy_hours: float = float(_env("HOLD_HEAVY_HOURS", "3"))
     dry_run: bool = _bool("DRY_RUN", False)  # ничего не отправлять, только печатать
 
     # --- Отбор ---
@@ -75,6 +82,9 @@ class Config:
 
     # --- Подпись канала ---
     channel_signature: str = _env("CHANNEL_SIGNATURE", "")  # например "@nhatrang_news"
+    # ссылка-подпись в конце готовых постов; адрес по умолчанию — из TELEGRAM_CHANNEL_ID (@имя)
+    subscribe_text: str = _env("SUBSCRIBE_TEXT", "Подписаться на Вьетнам новости")
+    subscribe_url: str = _env("SUBSCRIBE_URL", "")
 
     # Курс для пересчёта сумм в постах, текстом. Пусто — суммы останутся в донгах.
     rates: str = _env("RATES", "")

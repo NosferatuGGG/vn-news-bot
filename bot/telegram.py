@@ -1,6 +1,7 @@
 """Минимальный клиент Telegram Bot API (без сторонних библиотек)."""
 import html
 import json
+import re
 import logging
 import time
 
@@ -29,6 +30,64 @@ def build_post(data: dict, url: str, source: str) -> str:
     return "\n\n".join(parts)
 
 
+def _inline(text: str) -> str:
+    """Экранируем текст и превращаем **жирный** в <b>; непарные звёздочки просто убираем."""
+    out = html.escape(text.strip())
+    out = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", out, flags=re.DOTALL)
+    return out.replace("**", "")
+
+
+def subscribe_link() -> str:
+    url = CFG.subscribe_url
+    if not url and CFG.channel_id.startswith("@"):
+        url = f"https://t.me/{CFG.channel_id[1:]}"
+    if not url or not CFG.subscribe_text:
+        return ""
+    return f'<a href="{html.escape(url, quote=True)}">{html.escape(CFG.subscribe_text)}</a>'
+
+
+def build_channel_post(data: dict) -> str:
+    """Готовый пост для канала: жирный заголовок с эмодзи, абзацы, ссылка-подпись."""
+    head = f"{data['emoji']} {data['headline']}".strip() if data.get("emoji") else data["headline"]
+    parts = [f"<b>{_inline(head.replace('**', ''))}</b>"]
+    parts += [_inline(p) for p in data["paragraphs"]]
+    link = subscribe_link()
+    if link:
+        parts.append(link)
+    return "\n\n".join(parts)
+
+
+def visible_len(post_html: str) -> int:
+    """Сколько символов увидит Telegram (лимит подписи под фото — 1024)."""
+    return len(html.unescape(re.sub(r"<[^>]+>", "", post_html)))
+
+
+def build_post_card(post_html: str, score: int, category: str, sources: list, problems=None,
+                    note: str = "") -> str:
+    """Карточка для вас: пост ровно как будет в канале + под чертой результат проверки и источники."""
+    e = html.escape
+    status = ("⚠️ <b>Проверка не пройдена:</b>\n" + "\n".join(f"• {e(p)}" for p in problems[:6])) if problems \
+        else "✅ <b>Проверка пройдена</b>: все цифры есть в статьях"
+    meta = " · ".join(x for x in (f"{score}/10", CATEGORY_RU.get(category, ""),
+                                  f"{visible_len(post_html)}/1024 знаков") if x)
+    links = " · ".join(f'<a href="{e(s["url"], quote=True)}">{e(s["source"])}</a>' for s in sources)
+    tail = [status, f"<i>{e(meta)}</i>"]
+    if note:
+        tail.append(f"<i>{e(note)}</i>")
+    tail.append(f"🔗 {links}")
+    return post_html + "\n\n— — —\n" + "\n".join(tail)
+
+
+def post_buttons(item_id: int, status: str) -> list:
+    if status == "posted":
+        return [[{"text": "📄 Полный перевод", "callback_data": f"full:{item_id}"}]]
+    if status == "skipped":
+        return [[{"text": "↩️ Вернуть", "callback_data": f"back:{item_id}"}]]
+    return [[{"text": "🚀 Опубликовать", "callback_data": f"go:{item_id}"}],
+            [{"text": "📄 Полный перевод", "callback_data": f"full:{item_id}"},
+             {"text": "🚫 Мимо", "callback_data": f"skip:{item_id}"}]]
+
+
 CATEGORY_RU = {
     "russians": "русские", "crime": "криминал", "scam": "мошенники", "visa_law": "визы и законы",
     "money": "деньги", "flights": "перелёты", "weather": "погода", "incident": "происшествие",
@@ -54,7 +113,8 @@ def build_card(data: dict, score: int, category: str, source: str, url: str, pro
     return "\n\n".join(parts)
 
 
-MARKS = {"published": "✅ <b>ОПУБЛИКОВАНО</b>", "skipped": "🚫 <b>Пропущено</b>"}
+MARKS = {"published": "✅ <b>ОПУБЛИКОВАНО</b>", "skipped": "🚫 <b>Пропущено</b>", "posted": "✅ <b>В КАНАЛЕ</b>",
+         "queued": "🕒 <b>В очереди на публикацию</b>"}
 
 
 def card_buttons(item_id: int, status: str) -> list:
@@ -108,7 +168,7 @@ class Telegram:
     def send_post(self, chat_id: str, text: str, image: str = "", buttons=None) -> int:
         markup = {"inline_keyboard": buttons} if buttons else None
         extra = {"reply_markup": markup} if markup else {}
-        if image and len(text) <= CAPTION_LIMIT:
+        if image and visible_len(text) <= CAPTION_LIMIT:
             try:
                 res = self._call("sendPhoto", chat_id=chat_id, photo=image, caption=text, parse_mode="HTML", **extra)
                 return res["message_id"]
@@ -124,7 +184,7 @@ class Telegram:
         """Карточка с фото: короткая — подписью к фото, длинная — текстом с превью фото сверху.
         Возвращает (id сообщения, вид: photo | text)."""
         extra = {"reply_markup": {"inline_keyboard": buttons}} if buttons else {}
-        if image and len(text) <= CAPTION_LIMIT:
+        if image and visible_len(text) <= CAPTION_LIMIT:
             try:
                 res = self._call("sendPhoto", chat_id=chat_id, photo=image, caption=text, parse_mode="HTML",
                                  disable_notification=silent, **extra)
@@ -151,7 +211,9 @@ class Telegram:
     def edit_card(self, chat_id, message_id: int, kind: str, text: str, image: str = "", buttons=None):
         markup = {"inline_keyboard": buttons or []}
         if kind == "photo":
-            self._call("editMessageCaption", chat_id=chat_id, message_id=message_id, caption=text[:CAPTION_LIMIT],
+            if visible_len(text) > CAPTION_LIMIT and "\n\n— — —\n" in text:
+                text = text.split("\n\n— — —\n")[0]   # отметка не влезла — убираем служебный хвост карточки
+            self._call("editMessageCaption", chat_id=chat_id, message_id=message_id, caption=text,
                        parse_mode="HTML", reply_markup=markup)
         else:
             try:
