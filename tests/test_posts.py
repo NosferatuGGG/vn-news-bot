@@ -23,7 +23,7 @@ def _settings(monkeypatch):
     monkeypatch.setattr(CFG, "autopublish", False)
     monkeypatch.setattr(CFG, "admin_chat_id", "42")
     monkeypatch.setattr(CFG, "channel_id", "@novosti_vietnama")
-    monkeypatch.setattr(CFG, "subscribe_url", "")
+    monkeypatch.setattr(CFG, "subscribe_url", "https://t.me/novosti_vietnama")
     monkeypatch.setattr(CFG, "min_gap_min", 0)
     monkeypatch.setattr(CFG, "quiet_from", 0)
     monkeypatch.setattr(CFG, "quiet_to", 0)

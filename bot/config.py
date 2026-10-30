@@ -82,9 +82,9 @@ class Config:
 
     # --- Подпись канала ---
     channel_signature: str = _env("CHANNEL_SIGNATURE", "")  # например "@nhatrang_news"
-    # ссылка-подпись в конце готовых постов; адрес по умолчанию — из TELEGRAM_CHANNEL_ID (@имя)
+    # ссылка-подпись в конце готовых постов (для другого канала сети — свой адрес в SUBSCRIBE_URL)
     subscribe_text: str = _env("SUBSCRIBE_TEXT", "Подписаться на Вьетнам новости")
-    subscribe_url: str = _env("SUBSCRIBE_URL", "")
+    subscribe_url: str = _env("SUBSCRIBE_URL", "https://t.me/novosti_vietnama")
 
     # Курс для пересчёта сумм в постах, текстом. Пусто — суммы останутся в донгах.
     rates: str = _env("RATES", "")
