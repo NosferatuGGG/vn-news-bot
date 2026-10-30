@@ -1,0 +1,16 @@
+# Шаблон. Установщик setup/cloudflare.sh сам создаёт wrangler.toml с номером хранилища.
+name = "vn-news-bot-helper"
+main = "worker.js"
+compatibility_date = "2026-10-01"
+
+[[kv_namespaces]]
+binding = "BOT"
+id = "KV_ID"
+
+[triggers]
+crons = ["*/5 * * * *"]
+
+[vars]
+GITHUB_REPO = "NosferatuGGG/vn-news-bot"
+WORKFLOW = "bot.yml"
+RUN_EVERY_MIN = "20"

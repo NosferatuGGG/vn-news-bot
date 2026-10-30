@@ -89,6 +89,10 @@ class Config:
     # Курс для пересчёта сумм в постах, текстом. Пусто — суммы останутся в донгах.
     rates: str = _env("RATES", "")
 
+    # помощник на Cloudflare (worker/): мгновенные кнопки и публикация; пусто — работаем без него
+    worker_url: str = _env("WORKER_URL", "")
+    worker_secret: str = _env("WORKER_SECRET", "")
+
     db_path: str = _env("DB_PATH", "news.db")
     keep_days: int = _int("KEEP_DAYS", 14)   # сколько дней помнить уже увиденные новости
     extra: dict = field(default_factory=dict)

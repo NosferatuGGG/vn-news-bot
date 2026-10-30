@@ -174,3 +174,83 @@ def test_publish_button(tmp_path, monkeypatch):
     assert "В КАНАЛЕ" in edits[0][3] and toasts == ["Опубликовано в канале"]
     main._handle_one(store, tg, upd)                                     # повторное нажатие не дублирует пост
     assert len(sent) == 1 and toasts[-1] == "Уже в канале"
+
+
+# ---------- Помощник на Cloudflare ----------
+def _helper(monkeypatch, events=()):
+    from bot import helper
+    monkeypatch.setattr(CFG, "worker_url", "https://helper.example.workers.dev")
+    monkeypatch.setattr(CFG, "worker_secret", "s")
+    calls = []
+
+    def fake_call(body):
+        calls.append(body)
+        return {"ok": True, "events": list(events) if body.get("want_events") else []}
+
+    monkeypatch.setattr(helper, "_call", fake_call)
+    return calls
+
+
+def test_card_is_handed_to_helper(tmp_path, monkeypatch):
+    calls = _helper(monkeypatch)
+    store = _store_with(tmp_path, ("https://vne.vn/a", "VnExpress", {"status": "scored", "score": 8, "heavy": 0}))
+    _articles(monkeypatch, {"https://vne.vn/a": VN_TEXT})
+    monkeypatch.setattr(llm, "write_channel_post", lambda articles, fix_notes="": dict(GOOD))
+    tg = Telegram("x")
+    monkeypatch.setattr(tg, "send_card", lambda chat, card, *a, **k: (77, "photo"))
+    main.write_posts(store, tg, None)
+    post = calls[-1]["posts"][0]
+    assert post["status"] == "review" and post["card_msg_id"] == 77 and post["card_kind"] == "photo"
+    assert post["html"] == store.get(1)["post_html"] and "— — —" in post["card_html"]
+
+
+def test_autopilot_queue_goes_to_helper(tmp_path, monkeypatch):
+    calls = _helper(monkeypatch)
+    monkeypatch.setattr(CFG, "autopublish", True)
+    store = _store_with(tmp_path, ("https://vne.vn/a", "VnExpress", {"status": "scored", "score": 8, "heavy": 0}))
+    _articles(monkeypatch, {"https://vne.vn/a": VN_TEXT})
+    monkeypatch.setattr(llm, "write_channel_post", lambda articles, fix_notes="": dict(GOOD))
+    main.write_posts(store, Telegram("x"), None)
+    assert calls[-1]["posts"][0]["status"] == "queued" and store.get(1)["status"] == "queued"
+
+
+def test_helper_events_update_base_and_translation_runs_here(tmp_path, monkeypatch):
+    events = [{"key": "ev:1-1-posted", "action": "posted", "id": 1, "at": 1000.0},
+              {"key": "ev:2-2-full", "action": "full", "id": 2, "at": 1001.0}]
+    calls = _helper(monkeypatch, events)
+    store = _store_with(tmp_path,
+                        ("https://vne.vn/a", "VnExpress", {"status": "sent", "card_html": "c", "tg_message_id": 5}),
+                        ("https://vne.vn/b", "VnExpress", {"status": "sent", "card_html": "c", "tg_message_id": 6}))
+    monkeypatch.setattr(main, "fetch_article", lambda url: Article(VN_TEXT, "", None))
+    monkeypatch.setattr(llm, "translate", lambda text: "перевод")
+    tg = Telegram("x")
+    replies = []
+    monkeypatch.setattr(tg, "reply_long", lambda chat, reply_to, title, text: replies.append((reply_to, text)))
+    main.apply_helper_events(store, tg)
+    assert store.get(1)["status"] == "posted" and store.get(1)["posted_at"] == 1000.0
+    assert replies == [(6, "перевод")]
+    assert calls[-1]["ack"] == ["ev:1-1-posted", "ev:2-2-full"]
+    assert calls[0]["config"]["channel"] == "@novosti_vietnama" and calls[0]["config"]["tz_offset_min"] == 420
+
+
+def test_helper_fallback_publish_is_not_duplicated(tmp_path, monkeypatch):
+    """Помощник не нашёл пост → бот публикует сам и сообщает помощнику; если помощник успел сам — бот молчит."""
+    events = [{"key": "ev:1-1-go", "action": "go", "id": 1, "at": 1.0},
+              {"key": "ev:2-2-go", "action": "go", "id": 2, "at": 2.0},
+              {"key": "ev:3-2-posted", "action": "posted", "id": 2, "at": 3.0}]
+    calls = _helper(monkeypatch, events)
+    store = _store_with(tmp_path,
+                        ("https://vne.vn/a", "VnExpress", {"status": "sent", "post_html": "<b>1</b>", "card_html": "c1",
+                                                           "card_kind": "photo", "tg_message_id": 5}),
+                        ("https://vne.vn/b", "VnExpress", {"status": "sent", "post_html": "<b>2</b>", "card_html": "c2",
+                                                           "card_kind": "photo", "tg_message_id": 6}))
+    tg = Telegram("x")
+    sent = []
+    monkeypatch.setattr(tg, "send_post", lambda chat, text, image="": sent.append(text) or 99)
+    monkeypatch.setattr(tg, "edit_card", lambda *a: None)
+    main.apply_helper_events(store, tg)
+    assert sent == ["<b>1</b>"]                                           # второй пост помощник уже опубликовал
+    assert store.get(1)["status"] == "posted" and store.get(1)["tg_message_id"] == 5
+    assert store.get(2)["status"] == "posted"
+    told = [c["posts"][0] for c in calls if c.get("posts")]
+    assert told and told[0]["id"] == 1 and told[0]["status"] == "posted"

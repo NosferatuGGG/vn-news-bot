@@ -4,7 +4,7 @@ name: news-bot
 
 on:
   schedule:
-    - cron: "*/20 * * * *"     # каждые 20 минут (время UTC, для частоты это не важно)
+    - cron: "7 * * * *"        # запасной запуск раз в час; каждые 20 минут бота запускает помощник на Cloudflare
   workflow_dispatch:            # кнопка «Run workflow» для ручного запуска
   push:                         # и сразу после обновления кода бота
     branches: [main]
@@ -49,12 +49,14 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
           TELEGRAM_ADMIN_CHAT_ID: ${{ secrets.TELEGRAM_ADMIN_CHAT_ID }}
+          WORKER_SECRET: ${{ secrets.WORKER_SECRET }}
           # настройки (там же → вкладка Variables); не задано — значение по умолчанию
           LLM_PROVIDER: ${{ vars.LLM_PROVIDER }}
           MODEL_FAST: ${{ vars.MODEL_FAST }}
           MODEL_WRITER: ${{ vars.MODEL_WRITER }}
           MODE: ${{ vars.MODE }}
           OUTPUT: ${{ vars.OUTPUT }}
+          WORKER_URL: ${{ vars.WORKER_URL }}
           AUTOPUBLISH: ${{ vars.AUTOPUBLISH }}
           HOLD_HEAVY_HOURS: ${{ vars.HOLD_HEAVY_HOURS }}
           SUBSCRIBE_TEXT: ${{ vars.SUBSCRIBE_TEXT }}

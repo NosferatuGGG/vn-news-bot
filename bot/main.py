@@ -15,7 +15,7 @@ import traceback
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from . import llm, money, verify
+from . import helper, llm, money, verify
 from .config import CFG
 from .fetch import fetch_article, fetch_source
 from .filters import prefilter
@@ -273,9 +273,14 @@ def write_posts(store: Store, tg: Telegram | None, deadline: float | None):
             store.update(row["id"], status="error", note=msg[:300])
             continue
         if CFG.autopublish and not problems:
-            store.update(row["id"], status="queued", post_html=post, image=image, note=note)
-            log.info("  [%s/10 — В ОЧЕРЕДЬ] %s (%.0f с)", row["score"], row["title_ru"], time.time() - started)
-            continue
+            try:
+                if helper.enabled():
+                    helper.upload(row, post, image, "queued")   # публикует помощник, точно по расписанию
+                store.update(row["id"], status="queued", post_html=post, image=image, note=note)
+                log.info("  [%s/10 — В ОЧЕРЕДЬ] %s (%.0f с)", row["score"], row["title_ru"], time.time() - started)
+                continue
+            except helper.HelperError as err:
+                log.warning("Помощник недоступен (%s) — пришлю пост вам на кнопку", err)
         card = build_post_card(post, row["score"], row["category"] or "", articles, problems, note)
         msg_id, kind = 0, "text"
         if tg and CFG.admin_chat_id:
@@ -290,6 +295,12 @@ def write_posts(store: Store, tg: Telegram | None, deadline: float | None):
                 continue
         store.update(row["id"], status="sent", post_html=post, card_html=card, image=image, tg_message_id=msg_id,
                      card_kind=kind, note="; ".join(problems)[:300] or note)
+        if helper.enabled():
+            try:
+                helper.upload(row, post, image, "review", card, kind, msg_id)
+            except helper.HelperError as err:
+                # кнопка всё равно сработает: помощник передаст нажатие боту, и бот опубликует сам
+                log.warning("Пост не передан помощнику: %s", err)
         log.info("  [%s/10 — ПРИСЛАЛ%s] %s (%.0f с)", row["score"], " С ПОМЕТКОЙ" if problems else "",
                  row["title_ru"], time.time() - started)
 
@@ -362,7 +373,9 @@ def can_post_now(store: Store) -> bool:
 def publish(store: Store, tg: Telegram, item_id: int):
     row = store.get(item_id)
     msg_id = tg.send_post(CFG.channel_id, row["post_html"], row["image"] or "")
-    store.update(item_id, status="posted", posted_at=time.time(), tg_message_id=msg_id)
+    # у поста с карточкой tg_message_id — это карточка у вас в личке, её номер нужен для «Полного перевода»
+    extra = {} if row["card_html"] else {"tg_message_id": msg_id}
+    store.update(item_id, status="posted", posted_at=time.time(), **extra)
     log.info("Опубликовано: %s", row["title_ru"])
 
 
@@ -408,6 +421,8 @@ def _handle_one(store: Store, tg: Telegram, upd: dict):
     chat_id, message_id = msg["chat"]["id"], msg["message_id"]
 
     def toast(text):
+        if not cb.get("id"):
+            return   # событие от помощника — он уже ответил на нажатие сам
         try:
             tg.answer_callback(cb["id"], text)
         except Exception as err:  # noqa: BLE001 — нажатие обработано позже, Telegram уже не ждёт ответа
@@ -464,9 +479,55 @@ def _handle_one(store: Store, tg: Telegram, upd: dict):
 
 
 # ---------- Точки входа ----------
-def check_buttons(store: Store, tg: Telegram | None, timeout: int = 0):
+def apply_helper_events(store: Store, tg: Telegram):
+    """События от помощника на Cloudflare: публикации и пропуски он уже сделал сам — отмечаем в базе;
+    перевод и кнопки старых карточек выполняем здесь."""
+    events = helper.sync()
+    posted_by_helper = {int(e.get("id") or 0) for e in events if e.get("action") == "posted"}
+    done = []
+    for ev in events:
+        row = store.get(int(ev.get("id") or 0))
+        action = ev.get("action")
+        try:
+            if not row:
+                pass
+            elif action == "posted":
+                store.update(row["id"], status="posted", posted_at=ev.get("at") or time.time())
+                log.info("Помощник опубликовал: %s", row["title_ru"])
+            elif action in ("skipped", "back", "expired"):
+                store.update(row["id"], status={"skipped": "skipped", "back": "sent", "expired": "skipped"}[action])
+            elif action == "go" and row["id"] in posted_by_helper:
+                pass   # помощник уже опубликовал этот пост сам — второй раз не шлём
+            elif action in ("go", "full", "pub", "unpub", "skip"):
+                fake = {"update_id": 0, "callback_query": {
+                    "id": "", "data": f"{action}:{row['id']}", "from": {"id": CFG.admin_chat_id},
+                    "message": {"message_id": row["tg_message_id"], "chat": {"id": CFG.admin_chat_id}}}}
+                _handle_one(store, tg, fake)
+                row = store.get(row["id"])
+                if action == "go" and row["status"] == "posted" and row["card_html"]:
+                    # сообщаем помощнику, что пост уже в канале, — повторное нажатие его не продублирует
+                    helper.upload(row, row["post_html"], row["image"] or "", "posted", row["card_html"],
+                                  row["card_kind"] or "", row["tg_message_id"] or 0)
+        except Exception as err:  # noqa: BLE001
+            log.warning("Событие помощника %s не обработано: %s", ev, err)
+        done.append(ev["key"])
+    if done:
+        helper.sync(want_events=False, ack=done)
+        log.info("Событий от помощника: %d", len(done))
+
+
+def check_buttons(store: Store, tg: Telegram | None, timeout: int = 0, helper_too: bool = False):
     """Обработать нажатые кнопки модерации; сбой Telegram здесь не должен останавливать разбор."""
     if tg is None or CFG.dry_run or not CFG.admin_chat_id:
+        return
+    if helper.enabled():
+        # нажатия принимает помощник; забираем его события только в начале и в конце запуска
+        if helper_too:
+            try:
+                apply_helper_events(store, tg)
+            except Exception as err:  # noqa: BLE001
+                log.warning("Не удалось связаться с помощником: %s", err)
+                print(f"::warning title=Помощник на Cloudflare::{str(err)[:300]}", flush=True)
         return
     try:
         handle_updates(store, tg, timeout=timeout)
@@ -482,19 +543,19 @@ def _notice(text: str):
 
 def run_once(store: Store, tg: Telegram):
     """Один проход — для запуска по расписанию (GitHub Actions, cron)."""
-    if not CFG.dry_run:
+    if not CFG.dry_run and not helper.enabled():   # при помощнике кнопки приходят к нему, вебхук не трогаем
         try:
             info = tg.updates_info()
             _notice(f"Telegram: ждут обработки {info.get('pending_update_count', '?')}, "
                     f"принимаю {info.get('allowed_updates', 'всё')}, вебхук: {info.get('url') or 'нет'}")
         except Exception as err:  # noqa: BLE001
             _notice(f"Telegram не ответил на проверку: {str(err)[:200]}")
-    check_buttons(store, tg)          # сначала нажатые тобой кнопки
+    check_buttons(store, tg, helper_too=True)   # сначала нажатые тобой кнопки
     collect(store)
     # GitHub прерывает запуск через 15 минут — заканчиваем разбор заранее, чтобы успеть всё сохранить
     llm_ok = process(store, tg, deadline=time.time() + CFG.run_budget_min * 60)
-    check_buttons(store, tg)          # и те, что нажаты, пока шёл разбор
-    if CFG.autopublish and not CFG.dry_run:
+    check_buttons(store, tg, helper_too=True)   # и те, что нажаты, пока шёл разбор
+    if CFG.autopublish and not CFG.dry_run and not helper.enabled():
         try:
             publish_from_queue(store, tg)   # проверенные посты — в канал по расписанию
         except TelegramError as err:
@@ -520,6 +581,10 @@ def run_forever(store: Store, tg: Telegram):
                 process(store, tg)
                 next_scan = time.time() + CFG.scan_interval_min * 60
                 store.prune(days=CFG.keep_days)
+            if helper.enabled():
+                check_buttons(store, tg, helper_too=True)
+                time.sleep(60)
+                continue
             if CFG.autopublish and not CFG.dry_run:
                 publish_from_queue(store, tg)
             if CFG.admin_chat_id and not CFG.dry_run:
