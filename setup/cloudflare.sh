@@ -42,12 +42,30 @@ WR=(npx -y wrangler@4)
 
 # ---------- 2. Вход в Cloudflare ----------
 step "2/6 Вход в Cloudflare"
-echo "Сейчас откроется браузер. ${B}Проверьте, что вверху страницы нужный аккаунт Cloudflare${X},"
-echo "и нажмите Allow. Если открылся не тот аккаунт — выйдите из него в браузере и войдите в нужный."
-read -r -p "Нажмите Enter, чтобы продолжить… " _ </dev/tty 2>/dev/null || true
 "${WR[@]}" logout >/dev/null 2>&1 || true
-"${WR[@]}" login
-ok "Вход выполнен: $("${WR[@]}" whoami 2>/dev/null | grep -Eo '[^ ]+@[^ ]+' | head -1 || echo 'аккаунт Cloudflare')"
+unset CLOUDFLARE_API_TOKEN
+echo "Ниже появится длинная ссылка ${B}https://dash.cloudflare.com/oauth2/…${X}"
+echo "1) Скопируйте её целиком и откройте в Chrome или Safari на этом Mac."
+echo "2) Проверьте, что вверху страницы нужный аккаунт Cloudflare, и нажмите Allow."
+echo "${Y}Если после Allow страница «localhost» не открывается — выключите VPN и запустите команду заново.${X}"
+echo "Чтобы войти по ключу вместо ссылки, нажмите Ctrl+C один раз."
+echo
+trap 'true' INT                     # Ctrl+C прерывает только вход, а не всю установку
+LOGIN_OK=1
+"${WR[@]}" login --browser=false || LOGIN_OK=0
+trap - INT
+if [ "$LOGIN_OK" = 0 ]; then
+  echo
+  echo "${B}Вход по ключу.${X} Откройте в браузере: ${B}https://dash.cloudflare.com/profile/api-tokens${X}"
+  echo "  Create Token → строка «Edit Cloudflare Workers» → Use template →"
+  echo "  внизу Continue to summary → Create Token → Copy."
+  read -r -s -p "Вставьте ключ (Cmd+V, символы не видны) и нажмите Enter: " CLOUDFLARE_API_TOKEN </dev/tty
+  echo
+  export CLOUDFLARE_API_TOKEN
+  [ -n "$CLOUDFLARE_API_TOKEN" ] || die "Ключ пустой"
+fi
+WHO="$("${WR[@]}" whoami 2>&1)" || { echo "$WHO"; die "Cloudflare не пустил — проверьте ключ или вход"; }
+ok "Вход выполнен: $(echo "$WHO" | grep -Eo '[^ ]+@[^ .]+\.[^ ]+' | head -1 || echo 'аккаунт Cloudflare')"
 
 # ---------- 3. Файлы помощника ----------
 step "3/6 Скачиваю помощника"
