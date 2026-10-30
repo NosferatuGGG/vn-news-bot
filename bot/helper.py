@@ -49,6 +49,9 @@ def sync(want_events: bool = True, ack: list | None = None) -> list:
     data = _call({"config": config_payload(), "want_events": want_events, "ack": ack or []})
     if data.get("webhook"):
         log.info("Помощник подключил кнопки Telegram к себе")
+    if data.get("webhook_error"):
+        log.warning("Кнопки к помощнику пока не подключены (повторю в следующий раз): %s", data["webhook_error"])
+        print(f"::warning title=Помощник на Cloudflare::{str(data['webhook_error'])[:300]}", flush=True)
     return sorted(data.get("events") or [], key=lambda e: e.get("at", 0))
 
 

@@ -242,10 +242,16 @@ async function sync(env, request, body) {
     const cfg = { ...old, ...body.config };
     const hook = `${new URL(request.url).origin}/tg`;
     if (cfg.webhook !== hook || old.token !== cfg.token) {
-      await tg(cfg, "setWebhook", { url: hook, secret_token: env.SHARED_SECRET, allowed_updates: ["callback_query"],
-                                     drop_pending_updates: false });
-      cfg.webhook = hook;
-      out.webhook = "set";
+      try {
+        await tg(cfg, "setWebhook", { url: hook, secret_token: env.SHARED_SECRET, allowed_updates: ["callback_query"],
+                                       drop_pending_updates: false });
+        cfg.webhook = hook;
+        out.webhook = "set";
+      } catch (e) {
+        // новый адрес *.workers.dev Telegram видит не сразу — попробуем при следующем запуске бота
+        cfg.webhook = "";
+        out.webhook_error = e.message;
+      }
     }
     await putJSON(env, "cfg", cfg);
   }
