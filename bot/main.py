@@ -483,7 +483,7 @@ def apply_helper_events(store: Store, tg: Telegram):
     """События от помощника на Cloudflare: публикации и пропуски он уже сделал сам — отмечаем в базе;
     перевод и кнопки старых карточек выполняем здесь."""
     events = helper.sync()
-    posted_by_helper = {int(e.get("id") or 0) for e in events if e.get("action") == "posted"}
+    handled = {int(e.get("id") or 0) for e in events if e.get("action") in ("posted", "scheduled")}
     done = []
     for ev in events:
         row = store.get(int(ev.get("id") or 0))
@@ -494,10 +494,17 @@ def apply_helper_events(store: Store, tg: Telegram):
             elif action == "posted":
                 store.update(row["id"], status="posted", posted_at=ev.get("at") or time.time())
                 log.info("Помощник опубликовал: %s", row["title_ru"])
+            elif action == "scheduled":
+                store.update(row["id"], status="scheduled")
+                log.info("Помощник поставил в расписание: %s", row["title_ru"])
             elif action in ("skipped", "back", "expired"):
                 store.update(row["id"], status={"skipped": "skipped", "back": "sent", "expired": "skipped"}[action])
-            elif action == "go" and row["id"] in posted_by_helper:
-                pass   # помощник уже опубликовал этот пост сам — второй раз не шлём
+            elif action == "go" and row["id"] in handled:
+                pass   # помощник уже поставил этот пост в расписание или опубликовал — второй раз не нужно
+            elif action == "go" and row["card_html"] and row["status"] != "posted":
+                # у помощника не было этого поста — передаём ему, он поставит пост на ближайший ровный час
+                helper.upload(row, row["post_html"], row["image"] or "", "schedule", row["card_html"],
+                              row["card_kind"] or "", row["tg_message_id"] or 0)
             elif action in ("go", "full", "pub", "unpub", "skip"):
                 fake = {"update_id": 0, "callback_query": {
                     "id": "", "data": f"{action}:{row['id']}", "from": {"id": CFG.admin_chat_id},

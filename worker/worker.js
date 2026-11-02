@@ -8,6 +8,7 @@
 //   cfg            — настройки и токен Telegram, их присылает сам бот при каждом запуске
 //   post:<id>      — готовый пост и карточка для вас
 //   q:<id>         — пост ждёт публикации в очереди автопилота
+//   slot:<время>   — пост, отложенный кнопкой «Опубликовать» на ровный час (время — секунды UTC)
 //   ev:<время>-<id>-<действие> — что произошло (нажатия, публикации); бот забирает и удаляет
 //   pub            — когда и сколько постов вышло сегодня
 // Секреты: SHARED_SECRET (общий с ботом), GITHUB_TOKEN (запускать бота). Переменные: GITHUB_REPO, WORKFLOW.
@@ -28,12 +29,23 @@ export function visibleLen(html) {
   return [...text].length;
 }
 
-export function marked(card, status) {
+export function hhmm(cfg, sec) {
+  return new Date(sec * 1000 + (cfg.tz_offset_min || 420) * 60000).toISOString().slice(11, 16);
+}
+
+export function marked(card, status, cfg = {}, slot = 0) {
+  if (status === "scheduled") return `🕒 <b>Выйдет в ${hhmm(cfg, slot)}</b> (время Вьетнама)\n\n${card}`;
   return MARKS[status] ? `${MARKS[status]}\n\n${card}` : card;
 }
 
 export function postButtons(id, status) {
   if (status === "posted") return [[{ text: "📄 Полный перевод", callback_data: `full:${id}` }]];
+  if (status === "scheduled") {
+    return [
+      [{ text: "⚡ Опубликовать сейчас", callback_data: `now:${id}` }],
+      [{ text: "📄 Полный перевод", callback_data: `full:${id}` }, { text: "↩️ Отменить", callback_data: `unsched:${id}` }],
+    ];
+  }
   if (status === "skipped") return [[{ text: "↩️ Вернуть", callback_data: `back:${id}` }]];
   return [
     [{ text: "🚀 Опубликовать", callback_data: `go:${id}` }],
@@ -93,7 +105,7 @@ export async function sendPost(cfg, post) {
 
 async function redrawCard(cfg, post, status) {
   if (!post.card_msg_id || !post.card_html) return;
-  let text = marked(post.card_html, status);
+  let text = marked(post.card_html, status, cfg, post.slot);
   const markup = { inline_keyboard: postButtons(post.id, status) };
   try {
     if (post.card_kind === "photo") {
@@ -121,6 +133,7 @@ async function publish(env, cfg, id, how, now = Date.now()) {
   post.channel_msg_id = msgId;
   await putJSON(env, `post:${id}`, post);
   await env.BOT.delete(`q:${id}`);
+  if (post.slot) await env.BOT.delete(`slot:${post.slot}`);
   const pub = await getJSON(env, "pub", { last: 0, day: "", count: 0 });
   const day = localDay(cfg, now);
   await putJSON(env, "pub", { last: post.posted_at, day, count: (pub.day === day ? pub.count : 0) + 1 });
@@ -143,6 +156,66 @@ export function isQuiet(cfg, now = Date.now()) {
   return from > to ? (h >= from || h < to) : (h >= from && h < to);
 }
 
+// ---------- отложенная публикация: ближайший свободный ровный час ----------
+export async function nextFreeSlot(env, cfg, now = Date.now()) {
+  let slot = Math.floor(now / 3600000) * 3600 + 3600;            // следующий ровный час
+  for (let i = 0; i < 24 * 7; i++, slot += 3600) {
+    if (isQuiet(cfg, slot * 1000)) continue;                      // ночью не публикуем
+    if ((await env.BOT.get(`slot:${slot}`)) === null) return slot;
+  }
+  throw new Error("нет свободного часа на неделю вперёд");
+}
+
+export async function schedulePost(env, cfg, id, now = Date.now()) {
+  const post = await getJSON(env, `post:${id}`);
+  if (!post) return { ok: false, why: "missing" };
+  if (post.status === "posted") return { ok: false, why: "already" };
+  if (post.status === "scheduled" && post.slot) return { ok: true, slot: post.slot, post };
+  const slot = await nextFreeSlot(env, cfg, now);
+  await env.BOT.put(`slot:${slot}`, String(id));
+  post.status = "scheduled";
+  post.slot = slot;
+  await putJSON(env, `post:${id}`, post);
+  await env.BOT.delete(`q:${id}`);
+  await addEvent(env, "scheduled", id, { slot });
+  await redrawCard(cfg, post, "scheduled");
+  return { ok: true, slot, post };
+}
+
+async function unschedule(env, cfg, post) {
+  if (post.slot) await env.BOT.delete(`slot:${post.slot}`);
+  post.status = "review";
+  post.slot = 0;
+  await putJSON(env, `post:${post.id}`, post);
+  await addEvent(env, "back", post.id);
+  await redrawCard(cfg, post, "review");
+}
+
+// Пора публиковать отложенное. Если помощник пропустил несколько часов, выходит один пост,
+// а остальные переносятся на следующие свободные часы — чтобы не было пачки подряд.
+export async function publishDue(env, cfg, now = Date.now()) {
+  if (!cfg) return null;
+  const list = await env.BOT.list({ prefix: "slot:" });
+  const due = list.keys.map((k) => Number(k.name.slice(5))).filter((t) => t * 1000 <= now + 60000).sort((a, b) => a - b);
+  let done = null;
+  for (const slot of due) {
+    const id = await env.BOT.get(`slot:${slot}`);
+    const post = id && (await getJSON(env, `post:${id}`));
+    if (!post || post.status !== "scheduled" || post.slot !== slot) { await env.BOT.delete(`slot:${slot}`); continue; }
+    if (done === null) {
+      const res = await publish(env, cfg, post.id, "slot", now);
+      if (res.ok) done = post.id;
+      continue;
+    }
+    await env.BOT.delete(`slot:${slot}`);
+    post.status = "review";
+    post.slot = 0;
+    await putJSON(env, `post:${post.id}`, post);
+    await schedulePost(env, cfg, post.id, now);
+  }
+  return done;
+}
+
 // ---------- кнопки ----------
 async function handleCallback(env, cb) {
   const cfg = await getJSON(env, "cfg");
@@ -155,8 +228,8 @@ async function handleCallback(env, cb) {
 
   if (action === "go") {
     try {
-      const res = await publish(env, cfg, id, "button");
-      if (res.ok) return answer("Опубликовано в канале");
+      const res = await schedulePost(env, cfg, id);
+      if (res.ok) return answer(`Выйдет в ${hhmm(cfg, res.slot)}`);
       if (res.why === "already") return answer("Уже в канале");
       // поста нет у помощника (например, карточка старая) — опубликует сам бот при следующем запуске
       await addEvent(env, "go", id);
@@ -169,7 +242,22 @@ async function handleCallback(env, cb) {
     }
   }
 
+  if (action === "now") {
+    try {
+      const res = await publish(env, cfg, id, "now");
+      return answer(res.ok ? "Опубликовано в канале" : res.why === "already" ? "Уже в канале" : "Пост не найден");
+    } catch (e) {
+      await tg(cfg, "sendMessage", { chat_id: cfg.admin, text: `⚠️ Пост не опубликован: ${e.message.slice(0, 300)}` }).catch(() => {});
+      return answer("Не получилось — подробности в чате");
+    }
+  }
+
   const post = await getJSON(env, `post:${id}`);
+  if (post && action === "unsched") {
+    if (post.status === "posted") return answer("Уже в канале");
+    await unschedule(env, cfg, post);
+    return answer("Публикация отменена");
+  }
   if (post && (action === "skip" || action === "back")) {
     if (post.status === "posted") return answer("Уже в канале");
     post.status = action === "skip" ? "skipped" : "review";
@@ -212,6 +300,9 @@ async function runBot(env) {
 // ---------- автопилот ----------
 export async function publishFromQueue(env, cfg, now = Date.now()) {
   if (!cfg?.autopublish || isQuiet(cfg, now)) return null;
+  const hour = Math.floor(now / 3600000) * 3600;
+  if (now - hour * 1000 > 5 * 60000) return null;                    // автопилот тоже выходит только в ровный час
+  if ((await env.BOT.get(`slot:${hour}`)) !== null) return null;     // этот час уже занят вашим постом
   const pub = await getJSON(env, "pub", { last: 0, day: "", count: 0 });
   if (now / 1000 - (pub.last || 0) < (cfg.min_gap_min ?? 45) * 60) return null;
   if (pub.day === localDay(cfg, now) && pub.count >= (cfg.max_per_day ?? 10)) return null;
@@ -257,7 +348,13 @@ async function sync(env, request, body) {
   }
   for (const p of body.posts || []) {
     const prev = await getJSON(env, `post:${p.id}`);
-    if (prev && prev.status === "posted") continue;      // уже в канале — не перезаписываем
+    if (prev && (prev.status === "posted" || prev.status === "scheduled")) continue;   // уже в канале или в расписании
+    if (p.status === "schedule") {                        // бот передаёт нажатие «Опубликовать», которое не дошло сюда
+      await putJSON(env, `post:${p.id}`, { ...p, status: "review" });
+      const cfg = await getJSON(env, "cfg");
+      if (cfg) await schedulePost(env, cfg, p.id);
+      continue;
+    }
     await putJSON(env, `post:${p.id}`, p);
     if (p.status === "queued") await env.BOT.put(`q:${p.id}`, String(p.score || 0));
   }
@@ -306,7 +403,12 @@ export default {
   // каждые 5 минут: автопилот публикует из очереди, раз в RUN_EVERY_MIN минут — запуск бота на GitHub
   async scheduled(event, env, ctx) {
     const cfg = await getJSON(env, "cfg");
-    try { await publishFromQueue(env, cfg); } catch (e) { console.log("Автопилот:", e.message); }
+    const now = event.scheduledTime || Date.now();
+    let published = null;
+    try { published = await publishDue(env, cfg, now); } catch (e) { console.log("Отложенные:", e.message); }
+    if (published === null) {
+      try { await publishFromQueue(env, cfg, now); } catch (e) { console.log("Автопилот:", e.message); }
+    }
     const every = Number(env.RUN_EVERY_MIN || 20);
     const minute = Math.floor(event.scheduledTime / 60000);
     if (minute % every < 5) await runBot(env);

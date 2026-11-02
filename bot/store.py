@@ -73,7 +73,7 @@ class Store:
     def recent_posted(self, hours: int = 72, limit: int = 40):
         since = time.time() - hours * 3600
         return self.db.execute(
-            "SELECT id, title_ru FROM items WHERE status IN ('posted','queued','review','sent','published','scored')"
+            "SELECT id, title_ru FROM items WHERE status IN ('posted','queued','review','sent','published','scored','scheduled')"
             " AND fetched_at>? ORDER BY fetched_at DESC LIMIT ?",
             (since, limit),
         ).fetchall()

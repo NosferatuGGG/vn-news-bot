@@ -233,11 +233,11 @@ def test_helper_events_update_base_and_translation_runs_here(tmp_path, monkeypat
     assert calls[0]["config"]["channel"] == "@novosti_vietnama" and calls[0]["config"]["tz_offset_min"] == 420
 
 
-def test_helper_fallback_publish_is_not_duplicated(tmp_path, monkeypatch):
-    """Помощник не нашёл пост → бот публикует сам и сообщает помощнику; если помощник успел сам — бот молчит."""
+def test_helper_fallback_go_is_scheduled_by_helper(tmp_path, monkeypatch):
+    """Помощник не нашёл пост → бот передаёт его помощнику на расписание; если помощник уже поставил — бот молчит."""
     events = [{"key": "ev:1-1-go", "action": "go", "id": 1, "at": 1.0},
               {"key": "ev:2-2-go", "action": "go", "id": 2, "at": 2.0},
-              {"key": "ev:3-2-posted", "action": "posted", "id": 2, "at": 3.0}]
+              {"key": "ev:3-2-scheduled", "action": "scheduled", "id": 2, "at": 3.0, "slot": 3600}]
     calls = _helper(monkeypatch, events)
     store = _store_with(tmp_path,
                         ("https://vne.vn/a", "VnExpress", {"status": "sent", "post_html": "<b>1</b>", "card_html": "c1",
@@ -247,10 +247,8 @@ def test_helper_fallback_publish_is_not_duplicated(tmp_path, monkeypatch):
     tg = Telegram("x")
     sent = []
     monkeypatch.setattr(tg, "send_post", lambda chat, text, image="": sent.append(text) or 99)
-    monkeypatch.setattr(tg, "edit_card", lambda *a: None)
     main.apply_helper_events(store, tg)
-    assert sent == ["<b>1</b>"]                                           # второй пост помощник уже опубликовал
-    assert store.get(1)["status"] == "posted" and store.get(1)["tg_message_id"] == 5
-    assert store.get(2)["status"] == "posted"
-    told = [c["posts"][0] for c in calls if c.get("posts")]
-    assert told and told[0]["id"] == 1 and told[0]["status"] == "posted"
+    assert sent == []                                                    # сам бот в канал не шлёт
+    asked = [c["posts"][0] for c in calls if c.get("posts")]
+    assert [(p["id"], p["status"], p["card_msg_id"]) for p in asked] == [(1, "schedule", 5)]
+    assert store.get(2)["status"] == "scheduled"

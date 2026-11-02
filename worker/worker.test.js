@@ -1,7 +1,7 @@
 // Проверка помощника без сети: KV и Telegram подменены. Запуск: node --test worker/worker.test.js
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import worker, { isQuiet, publishFromQueue, visibleLen } from "./worker.js";
+import worker, { isQuiet, nextFreeSlot, publishDue, publishFromQueue, schedulePost, visibleLen } from "./worker.js";
 
 function makeEnv() {
   const store = new Map();
@@ -63,30 +63,84 @@ test("чужой запрос без секрета не проходит", asyn
   assert.equal((await worker.fetch(req("/tg", {}), env)).status, 403);
 });
 
-test("кнопка «Опубликовать» сразу шлёт пост в канал и не дублирует его", async () => {
+const hdr = { "x-telegram-bot-api-secret-token": "s3cret" };
+const press = (data) => ({ callback_query: { id: "cb", data, from: { id: 42 }, message: { message_id: 99, chat: { id: 42 } } } });
+const VN = (h, m = 0, d = 2) => Date.UTC(2026, 10, d, h - 7, m);   // время по Вьетнаму → мс UTC
+
+test("«Опубликовать» ставит пост на ближайший ровный час, второй — на следующий", async () => {
   const env = makeEnv(); const calls = mockFetch();
-  await worker.fetch(req("/api/sync", { config: CFG, posts: [POST] }, auth), env);
-  const press = { callback_query: { id: "cb", data: "go:7", from: { id: 42 }, message: { message_id: 99, chat: { id: 42 } } } };
-  const hdr = { "x-telegram-bot-api-secret-token": "s3cret" };
-  await worker.fetch(req("/tg", press, hdr), env);
+  await worker.fetch(req("/api/sync", { config: CFG, posts: [POST, { ...POST, id: 8, card_msg_id: 100 }] }, auth), env);
+  const r1 = await schedulePost(env, CFG, 7, VN(14, 20));
+  const r2 = await schedulePost(env, CFG, 8, VN(14, 22));
+  assert.equal(r1.slot * 1000, VN(15));
+  assert.equal(r2.slot * 1000, VN(16));
+  assert.equal(calls.filter((c) => c.url.endsWith("/sendPhoto")).length, 0);          // в канал пока ничего
+  const edit = calls.find((c) => c.url.endsWith("/editMessageCaption"));
+  assert.match(edit.body.caption, /Выйдет в 15:00/);
+  assert.equal(edit.body.reply_markup.inline_keyboard[0][0].callback_data, "now:7");
+  // повторное нажатие не двигает время
+  assert.equal((await schedulePost(env, CFG, 7, VN(14, 40))).slot, r1.slot);
+});
+
+test("ночью не публикуем: после 22:00 — на 7:00 утра", async () => {
+  const env = makeEnv(); mockFetch();
+  assert.equal((await nextFreeSlot(env, CFG, VN(22, 10))) * 1000, VN(7, 0, 3));
+});
+
+test("в ровный час выходит один пост, следующий — через час", async () => {
+  const env = makeEnv(); const calls = mockFetch();
+  await worker.fetch(req("/api/sync", { config: CFG, posts: [POST, { ...POST, id: 8 }] }, auth), env);
+  await schedulePost(env, CFG, 7, VN(14, 20));
+  await schedulePost(env, CFG, 8, VN(14, 21));
+  assert.equal(await publishDue(env, CFG, VN(14, 55)), null);                         // ещё рано
+  assert.equal(await publishDue(env, CFG, VN(15, 0)), 7);
+  assert.equal(await publishDue(env, CFG, VN(15, 5)), null);
+  assert.equal(await publishDue(env, CFG, VN(16, 0)), 8);
+  assert.equal(calls.filter((c) => c.url.endsWith("/sendPhoto")).length, 2);
+});
+
+test("если помощник пропустил часы — один пост, остальные переносятся, а не выходят пачкой", async () => {
+  const env = makeEnv(); const calls = mockFetch();
+  await worker.fetch(req("/api/sync", { config: CFG, posts: [POST, { ...POST, id: 8 }] }, auth), env);
+  await schedulePost(env, CFG, 7, VN(14, 20));
+  await schedulePost(env, CFG, 8, VN(14, 21));
+  assert.equal(await publishDue(env, CFG, VN(17, 0)), 7);
+  assert.equal(calls.filter((c) => c.url.endsWith("/sendPhoto")).length, 1);
+  assert.equal(JSON.parse(env.store.get("post:8")).slot * 1000, VN(18));
+});
+
+test("кнопки: «Сейчас» публикует сразу, «Отменить» снимает с расписания, второй раз не дублирует", async () => {
+  const env = makeEnv(); const calls = mockFetch();
+  await worker.fetch(req("/api/sync", { config: CFG, posts: [POST, { ...POST, id: 8 }] }, auth), env);
+  await worker.fetch(req("/tg", press("go:7"), hdr), env);
+  assert.match(calls.filter((c) => c.url.endsWith("/answerCallbackQuery")).at(-1).body.text, /^Выйдет в \d\d:00$/);
+  await worker.fetch(req("/tg", press("now:7"), hdr), env);
   const photo = calls.find((c) => c.url.endsWith("/sendPhoto"));
   assert.equal(photo.body.chat_id, "@novosti_vietnama");
-  assert.equal(photo.body.caption, POST.html);                         // в канал — пост без служебного хвоста
-  const edit = calls.find((c) => c.url.endsWith("/editMessageCaption"));
-  assert.match(edit.body.caption, /В КАНАЛЕ/);
-  assert.equal(calls.find((c) => c.url.endsWith("/answerCallbackQuery")).body.text, "Опубликовано в канале");
-
-  await worker.fetch(req("/tg", press, hdr), env);
-  assert.equal(calls.filter((c) => c.url.endsWith("/sendPhoto")).length, 1);
+  assert.equal(photo.body.caption, POST.html);                          // в канал — пост без служебного хвоста
+  assert.equal([...env.store.keys()].filter((k) => k.startsWith("slot:")).length, 0);   // час освободился
+  await worker.fetch(req("/tg", press("go:7"), hdr), env);
   assert.equal(calls.filter((c) => c.url.endsWith("/answerCallbackQuery")).at(-1).body.text, "Уже в канале");
+  assert.equal(calls.filter((c) => c.url.endsWith("/sendPhoto")).length, 1);
+
+  await worker.fetch(req("/tg", press("go:8"), hdr), env);
+  await worker.fetch(req("/tg", press("unsched:8"), hdr), env);
+  assert.equal(JSON.parse(env.store.get("post:8")).status, "review");
+  assert.equal([...env.store.keys()].filter((k) => k.startsWith("slot:")).length, 0);
 
   const out = await (await worker.fetch(req("/api/sync", { want_events: true }, auth), env)).json();
-  assert.equal(out.events.length, 1);
-  assert.equal(out.events[0].action, "posted");
-  assert.equal(out.events[0].channel_msg_id, 555);
-  await worker.fetch(req("/api/sync", { ack: [out.events[0].key] }, auth), env);
+  assert.deepEqual(out.events.map((e) => `${e.action}:${e.id}`), ["scheduled:7", "posted:7", "scheduled:8", "back:8"]);
+  await worker.fetch(req("/api/sync", { ack: out.events.map((e) => e.key) }, auth), env);
   const after = await (await worker.fetch(req("/api/sync", { want_events: true }, auth), env)).json();
   assert.deepEqual(after.events, []);
+});
+
+test("бот передаёт нажатие, которое не дошло до помощника, — пост встаёт в расписание", async () => {
+  const env = makeEnv(); mockFetch();
+  await worker.fetch(req("/api/sync", { config: CFG, posts: [{ ...POST, status: "schedule" }] }, auth), env);
+  const post = JSON.parse(env.store.get("post:7"));
+  assert.equal(post.status, "scheduled");
+  assert.ok(env.store.has(`slot:${post.slot}`));
 });
 
 test("чужие нажатия игнорируются", async () => {
@@ -110,7 +164,7 @@ test("перевод — событие для бота и немедленны�
 test("автопилот: тишина ночью, интервал, лучший пост первым", async () => {
   const env = makeEnv(); const calls = mockFetch();
   const cfg = { ...CFG, autopublish: true };
-  const noonVN = Date.UTC(2026, 9, 31, 5, 0);          // 12:00 по Вьетнаму
+  const noonVN = Date.UTC(2026, 9, 31, 5, 0);          // 12:00 по Вьетнаму, ровный час
   const nightVN = Date.UTC(2026, 9, 31, 17, 0);        // 00:00 по Вьетнаму
   assert.equal(isQuiet(cfg, nightVN), true);
   assert.equal(isQuiet(cfg, noonVN), false);
@@ -123,7 +177,8 @@ test("автопилот: тишина ночью, интервал, лучши�
   assert.equal(await publishFromQueue(env, cfg, nightVN), null);
   assert.equal(await publishFromQueue(env, cfg, noonVN), 2);
   assert.equal(await publishFromQueue(env, cfg, noonVN + 10 * 60000), null);          // рано, нужно 45 минут
-  assert.equal(await publishFromQueue(env, cfg, noonVN + 50 * 60000), 1);
+  assert.equal(await publishFromQueue(env, cfg, noonVN + 50 * 60000), null);         // автопилот — только в ровный час
+  assert.equal(await publishFromQueue(env, cfg, noonVN + 60 * 60000), 1);
   assert.equal(JSON.parse(env.store.get("post:3")).status, "expired");
   assert.equal(calls.filter((c) => c.url.endsWith("/sendPhoto")).length, 2);
 });
