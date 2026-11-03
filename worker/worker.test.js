@@ -189,3 +189,41 @@ test("таймер запускает бота раз в 20 минут", async (
   await worker.scheduled({ scheduledTime: Date.UTC(2026, 9, 31, 5, 25) }, env, {});
   assert.equal(calls.filter((c) => c.url.includes("dispatches")).length, 1);
 });
+
+test("«Убрать из канала»: сначала переспрашивает, потом удаляет пост и возвращает карточку", async () => {
+  const env = makeEnv(); const calls = mockFetch();
+  await worker.fetch(req("/api/sync", { config: CFG, posts: [POST] }, auth), env);
+  await worker.fetch(req("/tg", press("now:7"), hdr), env);
+  assert.equal(JSON.parse(env.store.get("post:7")).channel_msg_id, 555);
+
+  await worker.fetch(req("/tg", press("del:7"), hdr), env);
+  assert.equal(calls.filter((c) => c.url.endsWith("/deleteMessage")).length, 0);       // одно нажатие ничего не удаляет
+  const ask = calls.filter((c) => c.url.endsWith("/editMessageReplyMarkup")).at(-1);
+  assert.equal(ask.body.reply_markup.inline_keyboard[0][0].callback_data, "delok:7");
+
+  await worker.fetch(req("/tg", press("keep:7"), hdr), env);
+  assert.equal(JSON.parse(env.store.get("post:7")).status, "posted");
+
+  await worker.fetch(req("/tg", press("delok:7"), hdr), env);
+  const del = calls.find((c) => c.url.endsWith("/deleteMessage"));
+  assert.deepEqual(del.body, { chat_id: "@novosti_vietnama", message_id: 555 });
+  const post = JSON.parse(env.store.get("post:7"));
+  assert.equal(post.status, "removed");
+  const card = calls.filter((c) => c.url.endsWith("/editMessageCaption")).at(-1);
+  assert.match(card.body.caption, /Убрано из канала/);
+  assert.equal(card.body.reply_markup.inline_keyboard[0][0].callback_data, "go:7");     // можно опубликовать заново
+
+  const out = await (await worker.fetch(req("/api/sync", { want_events: true }, auth), env)).json();
+  assert.deepEqual(out.events.map((e) => e.action), ["posted", "unposted"]);
+});
+
+test("после обновления у свежих постов в канале один раз появляется кнопка «Убрать»", async () => {
+  const { addRemoveButtons } = await import("./worker.js");
+  const env = makeEnv(); const calls = mockFetch();
+  const now = Date.now();
+  await env.BOT.put("post:7", JSON.stringify({ ...POST, status: "posted", channel_msg_id: 555, posted_at: now / 1000 - 3600 }));
+  await env.BOT.put("post:8", JSON.stringify({ ...POST, id: 8, status: "posted", channel_msg_id: 556, posted_at: now / 1000 - 72 * 3600 }));
+  assert.equal(await addRemoveButtons(env, CFG, now), 1);
+  assert.equal(await addRemoveButtons(env, CFG, now), 0);
+  assert.equal(calls.filter((c) => c.url.endsWith("/editMessageCaption")).at(-1).body.reply_markup.inline_keyboard[0][1].callback_data, "del:7");
+});

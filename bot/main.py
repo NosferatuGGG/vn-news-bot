@@ -497,8 +497,11 @@ def apply_helper_events(store: Store, tg: Telegram):
             elif action == "scheduled":
                 store.update(row["id"], status="scheduled")
                 log.info("Помощник поставил в расписание: %s", row["title_ru"])
-            elif action in ("skipped", "back", "expired"):
-                store.update(row["id"], status={"skipped": "skipped", "back": "sent", "expired": "skipped"}[action])
+            elif action in ("skipped", "back", "expired", "unposted"):
+                store.update(row["id"], status={"skipped": "skipped", "back": "sent", "expired": "skipped",
+                                                "unposted": "sent"}[action])
+                if action == "unposted":
+                    log.info("Помощник убрал из канала: %s", row["title_ru"])
             elif action == "go" and row["id"] in handled:
                 pass   # помощник уже поставил этот пост в расписание или опубликовал — второй раз не нужно
             elif action == "go" and row["card_html"] and row["status"] != "posted":

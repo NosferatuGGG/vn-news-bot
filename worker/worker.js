@@ -19,6 +19,7 @@ const MARKS = {
   posted: "✅ <b>В КАНАЛЕ</b>",
   skipped: "🚫 <b>Пропущено</b>",
   queued: "🕒 <b>В очереди на публикацию</b>",
+  removed: "🗑 <b>Убрано из канала</b>",
 };
 
 // ---------- мелочи ----------
@@ -39,7 +40,13 @@ export function marked(card, status, cfg = {}, slot = 0) {
 }
 
 export function postButtons(id, status) {
-  if (status === "posted") return [[{ text: "📄 Полный перевод", callback_data: `full:${id}` }]];
+  if (status === "posted") {
+    return [[{ text: "📄 Полный перевод", callback_data: `full:${id}` }, { text: "🗑 Убрать из канала", callback_data: `del:${id}` }]];
+  }
+  if (status === "confirm_del") {
+    return [[{ text: "✅ Да, убрать из канала", callback_data: `delok:${id}` }],
+            [{ text: "Нет, оставить", callback_data: `keep:${id}` }]];
+  }
   if (status === "scheduled") {
     return [
       [{ text: "⚡ Опубликовать сейчас", callback_data: `now:${id}` }],
@@ -61,8 +68,10 @@ async function getJSON(env, key, fallback = null) {
 
 const putJSON = (env, key, value) => env.BOT.put(key, JSON.stringify(value));
 
+let evSeq = 0;   // события в одну миллисекунду не должны перепутаться местами
 async function addEvent(env, action, id, extra = {}) {
-  const key = `ev:${Date.now()}-${id}-${action}`;
+  evSeq = (evSeq + 1) % 1000000;
+  const key = `ev:${Date.now()}-${String(evSeq).padStart(6, "0")}-${id}-${action}`;
   await putJSON(env, key, { key, action, id: Number(id), at: Date.now() / 1000, ...extra });
 }
 
@@ -139,6 +148,29 @@ async function publish(env, cfg, id, how, now = Date.now()) {
   await putJSON(env, "pub", { last: post.posted_at, day, count: (pub.day === day ? pub.count : 0) + 1 });
   await addEvent(env, "posted", id, { channel_msg_id: msgId, how });
   await redrawCard(cfg, post, "posted");
+  return { ok: true, post };
+}
+
+// Убрать пост из канала. Telegram разрешает ботам удалять сообщения только первые 48 часов.
+export async function unpublish(env, cfg, id) {
+  const post = await getJSON(env, `post:${id}`);
+  if (!post) return { ok: false, why: "missing" };
+  if (post.status !== "posted") return { ok: false, why: "not_posted" };
+  if (!post.channel_msg_id) return { ok: false, why: "no_msg" };
+  try {
+    await tg(cfg, "deleteMessage", { chat_id: cfg.channel, message_id: post.channel_msg_id });
+  } catch (e) {
+    if (!/not found|MESSAGE_ID_INVALID/i.test(e.message)) return { ok: false, why: "telegram", error: e.message };
+    // сообщения в канале уже нет (удалили руками) — просто снимаем отметку
+  }
+  post.status = "removed";
+  post.channel_msg_id = 0;
+  post.slot = 0;
+  await putJSON(env, `post:${id}`, post);
+  const pub = await getJSON(env, "pub", { last: 0, day: "", count: 0 });
+  if (pub.day === localDay(cfg) && pub.count > 0) await putJSON(env, "pub", { ...pub, count: pub.count - 1 });
+  await addEvent(env, "unposted", id);
+  await redrawCard(cfg, post, "removed");
   return { ok: true, post };
 }
 
@@ -252,6 +284,27 @@ async function handleCallback(env, cb) {
     }
   }
 
+  if (action === "del" || action === "keep") {
+    // «Убрать из канала» — сначала переспрашиваем, чтобы случайное нажатие ничего не удалило
+    const p = await getJSON(env, `post:${id}`);
+    if (!p || p.status !== "posted") return answer(p ? "Этого поста нет в канале" : "Пост не найден");
+    await tg(cfg, "editMessageReplyMarkup", { chat_id: cfg.admin, message_id: cb.message?.message_id,
+                                              reply_markup: { inline_keyboard: postButtons(id, action === "del" ? "confirm_del" : "posted") } })
+      .catch((e) => console.log("Кнопки не обновились:", e.message));
+    return answer(action === "del" ? "Точно убрать пост из канала?" : "Оставил");
+  }
+  if (action === "delok") {
+    const res = await unpublish(env, cfg, id);
+    if (res.ok) return answer("Пост убран из канала");
+    if (res.why === "telegram") {
+      await tg(cfg, "sendMessage", { chat_id: cfg.admin,
+        text: `⚠️ Telegram не дал удалить пост: ${res.error.slice(0, 200)}\nБот может удалять посты только первые 48 часов — дальше удалите его в канале вручную.` }).catch(() => {});
+      return answer("Не получилось — подробности в чате");
+    }
+    if (res.why === "no_msg") return answer("Не знаю номер сообщения в канале — удалите пост вручную");
+    return answer(res.why === "not_posted" ? "Этого поста уже нет в канале" : "Пост не найден");
+  }
+
   const post = await getJSON(env, `post:${id}`);
   if (post && action === "unsched") {
     if (post.status === "posted") return answer("Уже в канале");
@@ -259,6 +312,7 @@ async function handleCallback(env, cb) {
     return answer("Публикация отменена");
   }
   if (post && (action === "skip" || action === "back")) {
+    if (post.status === "removed" && action === "back") return answer("Пост уже не в канале");
     if (post.status === "posted") return answer("Уже в канале");
     post.status = action === "skip" ? "skipped" : "review";
     await putJSON(env, `post:${id}`, post);
@@ -323,6 +377,22 @@ export async function publishFromQueue(env, cfg, now = Date.now()) {
   if (!best) return null;
   const res = await publish(env, cfg, best.id, "auto", now);
   return res.ok ? best.id : null;
+}
+
+// Один раз после обновления: у постов последних 48 часов появляется кнопка «Убрать из канала»
+export async function addRemoveButtons(env, cfg, now = Date.now()) {
+  if ((await env.BOT.get("buttons_v2")) !== null) return 0;
+  await env.BOT.put("buttons_v2", "1");
+  let n = 0;
+  const list = await env.BOT.list({ prefix: "post:" });
+  for (const k of list.keys) {
+    const post = await getJSON(env, k.name);
+    if (post?.status === "posted" && post.channel_msg_id && now / 1000 - (post.posted_at || 0) < 48 * 3600) {
+      await redrawCard(cfg, post, "posted");
+      n++;
+    }
+  }
+  return n;
 }
 
 // ---------- связь с ботом ----------
@@ -404,6 +474,7 @@ export default {
   async scheduled(event, env, ctx) {
     const cfg = await getJSON(env, "cfg");
     const now = event.scheduledTime || Date.now();
+    if (cfg) { try { await addRemoveButtons(env, cfg, now); } catch (e) { console.log("Кнопки:", e.message); } }
     let published = null;
     try { published = await publishDue(env, cfg, now); } catch (e) { console.log("Отложенные:", e.message); }
     if (published === null) {
