@@ -83,4 +83,11 @@ jobs:
           git init -q -b state
           git add news.db
           git -c user.name="news-bot" -c user.email="news-bot@users.noreply.github.com" commit -qm "state $(date -u +%F_%H:%M)"
-          git push -qf "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" state
+          # GitHub иногда на секунду не принимает запись — пробуем ещё пару раз, а не роняем запуск
+          for i in 1 2 3 4; do
+            git push -qf "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" state && exit 0
+            echo "Не сохранилось с попытки $i, повторяю через $((i * 10)) с"
+            sleep $((i * 10))
+          done
+          echo "::error title=Память бота не сохранилась::GitHub четыре раза не принял запись. Бот продолжит со старой памятью."
+          exit 1
