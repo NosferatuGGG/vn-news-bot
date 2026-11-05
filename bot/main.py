@@ -349,6 +349,31 @@ def write_posts(store: Store, tg: Telegram | None, deadline: float | None):
                  row["title_ru"], time.time() - started)
 
 
+# Карточки, которые надо переписать заново (разовая просьба редактора): ключ — чтобы сделать это один раз
+REDO = {"redo_2026_11_06": [222287, 222805, 221320, 221475]}   # сигареты, Анзянг, Далат, BMC — корявый перевод
+
+
+def _redo_cards(store: Store, tg: Telegram | None):
+    """Старую карточку помечаем «заменено» и снимаем с неё кнопки, новость отправляем на переписывание."""
+    for key, ids in REDO.items():
+        if store.kv_get(key) == "1":
+            continue
+        for item_id in ids:
+            row = store.get(item_id)
+            if not row or row["status"] not in ("sent", "scored"):
+                continue
+            if tg and CFG.admin_chat_id and row["tg_message_id"] and not CFG.dry_run:
+                try:
+                    tg.edit_card(CFG.admin_chat_id, row["tg_message_id"], row["card_kind"] or "text",
+                                 "🔁 <b>Заменено — новая версия придёт отдельным сообщением</b>\n\n"
+                                 + (row["card_html"] or row["post_html"] or ""), row["image"] or "", buttons=[])
+                except Exception as err:  # noqa: BLE001
+                    log.info("Старую карточку %s не пометил: %s", item_id, err)
+            store.update(item_id, status="scored")
+            log.info("Переписываю заново: %s", row["title_ru"])
+        store.kv_set(key, "1")
+
+
 def process(store: Store, tg: Telegram | None, deadline: float | None = None) -> bool:
     """Возвращает False только при настоящем сбое (не при дневном лимите — он обнуляется сам)."""
     if store.kv_get("cards_v2") != "1":
@@ -362,6 +387,7 @@ def process(store: Store, tg: Telegram | None, deadline: float | None = None) ->
             db.execute("UPDATE items SET status='candidate' WHERE status='low' AND fetched_at>?",
                        (time.time() - 30 * 3600,))
         store.kv_set("rescore_v1", "1")
+    _redo_cards(store, tg)
     prefilter_queue(store)
     _load_quota_state(store)
     llm.DEADLINE = deadline

@@ -275,3 +275,24 @@ def test_polish_is_rejected_if_it_changes_numbers(monkeypatch):
     monkeypatch.setattr(llm, "polish_post", lambda d, s: {
         "emoji": "", "headline": "В Далате проложат 120 км линий", "paragraphs": ["Первую ветку сделают до 2030 года."]})
     assert main._polish(data, "") is data
+
+
+def test_redo_marks_old_card_and_rewrites(tmp_path, monkeypatch):
+    from bot import main
+    from bot.store import Store
+    store = Store(str(tmp_path / "t.db"))
+    store.add_item("u1", "VnExpress", "Đà Lạt", "", time.time())
+    store.update(1, status="sent", tg_message_id=420, card_kind="photo", card_html="<b>старое</b>")
+    monkeypatch.setattr(main, "REDO", {"redo_test": [1]})
+    monkeypatch.setattr(CFG, "dry_run", False)
+    monkeypatch.setattr(CFG, "admin_chat_id", "42")
+    edits = []
+
+    class TG:
+        def edit_card(self, *a, **k):
+            edits.append((a, k))
+
+    main._redo_cards(store, TG())
+    main._redo_cards(store, TG())
+    assert store.get(1)["status"] == "scored" and len(edits) == 1
+    assert "Заменено" in edits[0][0][3] and edits[0][1]["buttons"] == []
