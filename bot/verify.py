@@ -114,3 +114,27 @@ def check_numbers(post_text: str, articles_text: str) -> list:
             continue
         problems.append(f"цифры «{raw}» нет в статьях")
     return problems
+
+
+# Иероглифы, корейский, тайский, арабский и т. п. — нейросеть иногда «проваливается» в другой язык
+FOREIGN_SCRIPT = re.compile(r"[\u0590-\u08ff\u0e00-\u0eff\u1100-\u11ff\u3040-\u30ff\u3100-\u31ff"
+                            r"\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\uf900-\ufaff\uff00-\uffef]+")
+# вьетнамские буквы с диакритикой: в посте всё должно быть по-русски
+VIET_WORD = re.compile(r"\b\w*[ăâđêôơưáàãạảấầẩẫậắằẳẵặéèẹẻẽếềểễệíìĩỉịóòõọỏốồổỗộớờởỡợúùũụủứừửữựýỳỵỷỹ]\w*\b", re.IGNORECASE)
+
+
+def check_language(text: str) -> list:
+    """Куски не на русском: «с沒有 возврата», «xe khách»."""
+    problems = []
+    for m in FOREIGN_SCRIPT.finditer(text):
+        ctx = text[max(0, m.start() - 15):m.end() + 15].replace("\n", " ")
+        problems.append(f"в тексте посторонние символы «{m.group(0)}» («…{ctx}…») — напиши это по-русски")
+    for m in VIET_WORD.finditer(text):
+        problems.append(f"вьетнамское слово «{m.group(0)}» — напиши по-русски")
+    return problems[:5]
+
+
+def strip_foreign(text: str) -> str:
+    """Последний рубеж: убрать посторонние символы, если нейросеть так и не исправила."""
+    text = FOREIGN_SCRIPT.sub("", text)
+    return re.sub(r"[ \t]{2,}", " ", text)

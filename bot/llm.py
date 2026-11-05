@@ -15,7 +15,8 @@ import time
 import httpx
 
 from .config import CFG
-from .prompts import BRIEF_SYSTEM, FACTCHECK_SYSTEM, POST_SYSTEM, SCORE_SYSTEM, TRANSLATE_SYSTEM, WRITE_SYSTEM
+from .prompts import (BRIEF_SYSTEM, FACTCHECK_SYSTEM, POLISH_SYSTEM, POST_SYSTEM, SCORE_SYSTEM, TRANSLATE_SYSTEM,
+                      WRITE_SYSTEM)
 
 log = logging.getLogger(__name__)
 
@@ -453,6 +454,22 @@ def write_channel_post(articles: list, fix_notes: str = "") -> dict:
         user += ("\n\nПрошлый вариант поста не прошёл проверку. Перепиши и исправь всё это "
                  f"(цифру, которой нет в статьях, убери или замени словами):\n{fix_notes}\n")
     result = _call([CFG.model_writer, CFG.model_fast], POST_SYSTEM, user, "channel_post", POST_SCHEMA, 6000)
+    paras = result.get("paragraphs") or []
+    if isinstance(paras, str):
+        paras = paras.split("\n\n")
+    result["paragraphs"] = [str(p).strip() for p in paras if str(p).strip()][:6]
+    for key in ("emoji", "headline"):
+        value = result.get(key)
+        result[key] = "" if value is None else str(value).strip()
+    return result
+
+
+def polish_post(data: dict, src_text: str) -> dict:
+    """Литредактура: убрать кальки машинного перевода, штампы и корявости, не трогая факты."""
+    post = json.dumps({"emoji": data.get("emoji", ""), "headline": data["headline"], "paragraphs": data["paragraphs"]},
+                      ensure_ascii=False, indent=1)
+    user = f"ПОСТ:\n{post}\n\nИСХОДНЫЕ СТАТЬИ (только чтобы понять смысл):\n{src_text[:7000]}"
+    result = _call([CFG.model_writer, CFG.model_fast], POLISH_SYSTEM, user, "polish_post", POST_SCHEMA, 6000)
     paras = result.get("paragraphs") or []
     if isinstance(paras, str):
         paras = paras.split("\n\n")

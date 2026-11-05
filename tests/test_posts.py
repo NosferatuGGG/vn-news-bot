@@ -30,6 +30,7 @@ def _settings(monkeypatch):
     monkeypatch.setattr(CFG, "max_writes_per_run", 5)
     monkeypatch.setattr(money, "fetch_rates", lambda store=None: {"usd_rub": 83.4839, "vnd_rub": 0.00325651})
     monkeypatch.setattr(llm, "fact_check", lambda *a: {"ok": True, "problems": []})
+    monkeypatch.setattr(llm, "polish_post", lambda data, src: dict(data))   # литредактор ничего не меняет
 
 
 GOOD = {"emoji": "🏨", "headline": "В Нячанге поймали фейковых «отельеров»",
@@ -252,3 +253,25 @@ def test_helper_fallback_go_is_scheduled_by_helper(tmp_path, monkeypatch):
     asked = [c["posts"][0] for c in calls if c.get("posts")]
     assert [(p["id"], p["status"], p["card_msg_id"]) for p in asked] == [(1, "schedule", 5)]
     assert store.get(2)["status"] == "scheduled"
+
+
+def test_foreign_characters_are_caught_and_never_reach_the_channel():
+    from bot import verify
+    assert verify.check_language("Для частичной оплаты с沒有 возврата")
+    assert verify.check_language("водитель xe khách")
+    assert not verify.check_language("Lexus LS 600H за $312 000, Нячанг, Кханьхоа")
+    assert verify.strip_foreign("с沒有 возврата") == "с возврата"
+
+
+def test_polish_is_rejected_if_it_changes_numbers(monkeypatch):
+    from bot import llm, main
+    data = {"emoji": "🚝", "headline": "В Далате построят 100 км электропоездов",
+            "paragraphs": ["Первую ветку сделают до **2030 года**."]}
+    monkeypatch.setattr(llm, "polish_post", lambda d, s: {
+        "emoji": "", "headline": "В Далате проложат 100 км трамвайных линий",
+        "paragraphs": ["Первую ветку построят до **2030 года**."]})
+    out = main._polish(data, "")
+    assert out["headline"] == "В Далате проложат 100 км трамвайных линий" and out["emoji"] == "🚝"
+    monkeypatch.setattr(llm, "polish_post", lambda d, s: {
+        "emoji": "", "headline": "В Далате проложат 120 км линий", "paragraphs": ["Первую ветку сделают до 2030 года."]})
+    assert main._polish(data, "") is data

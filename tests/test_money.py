@@ -43,3 +43,11 @@ def test_rates_cached_per_day(tmp_path, monkeypatch):
     monkeypatch.setattr(money.httpx, "get", boom)
     store.kv_set("rates", '{"usd_rub": 80, "vnd_rub": 0.003, "fetched": "2000-01-01"}')
     assert money.fetch_rates(store)["usd_rub"] == 80          # сайт недоступен — последний сохранённый курс
+
+
+def test_dollars_get_one_format_and_rubles():
+    r = {"usd_rub": 80.97, "vnd_rub": 0.0031592}
+    assert money.annotate_all("Lexus стоимостью 312 000 USD.", r) == "Lexus стоимостью $312 000 (≈ 25,3 млн ₽)."
+    assert money.annotate_all("за $1,2 млн", r) == "за $1,2 млн (≈ 97,2 млн ₽)"
+    # пересчёт донгов уже содержит доллары — второй раз не пересчитываем
+    assert money.annotate_all("5 млрд донгов", r) == "5 млрд донгов (≈ $195 000 ≈ 15,8 млн ₽)"

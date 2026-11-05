@@ -187,11 +187,47 @@ def _check_post(data: dict, src_text: str) -> list:
     plain = "\n".join([data["headline"], *data["paragraphs"]])
     if not data["paragraphs"]:
         return ["нейросеть вернула пустой пост"]
-    problems = verify.check_numbers(plain, src_text)          # бесплатно и без ошибок нейросети
+    problems = verify.check_language(plain)                    # иероглифы и вьетнамские слова — сразу видно
+    problems += verify.check_numbers(plain, src_text)          # бесплатно и без ошибок нейросети
     check = llm.fact_check(plain, src_text)                    # додуманные детали, «нож» вместо «оружия» и т. п.
     if not check.get("ok"):
         problems += [str(p) for p in check.get("problems") or [] if str(p).strip()] or ["редактор нашёл неточность"]
     return problems
+
+
+def _numbers(text: str) -> list:
+    return sorted(round(v, 6) for _, v, *_ in verify.post_numbers(text))
+
+
+def _polish(data: dict, src_text: str) -> dict:
+    """Литредактура. Правку принимаем, только если цифры остались те же и не появилось нового мусора —
+    иначе оставляем пост как был (он уже прошёл проверку фактов)."""
+    if not data["paragraphs"]:
+        return data
+    try:
+        edited = llm.polish_post(data, src_text)
+    except (llm.LLMQuotaError, llm.LLMBusyError):
+        return data    # лимит или перегрузка — пост уже проверен, выйдет без литредактуры
+    except Exception as err:  # noqa: BLE001
+        log.info("Литредактура не получилась: %s", err)
+        return data
+    before = "\n".join([data["headline"], *data["paragraphs"]])
+    after = "\n".join([edited["headline"], *edited["paragraphs"]])
+    if not edited["paragraphs"] or not edited["headline"]:
+        return data
+    if _numbers(before) != _numbers(after):
+        log.info("Литредактор поменял цифры — оставляю как было")
+        return data
+    if len(verify.check_language(after)) > len(verify.check_language(before)):
+        return data
+    if not 0.6 <= len(after) / max(1, len(before)) <= 1.3:
+        log.info("Литредактор слишком сильно поменял объём — оставляю как было")
+        return data
+    if after != before:
+        log.info("Литредактура: «%s» → «%s»", data["headline"], edited["headline"])
+    if data.get("emoji") and not edited.get("emoji"):
+        edited["emoji"] = data["emoji"]
+    return edited
 
 
 def make_channel_post(articles: list, heavy: bool, rates: dict) -> tuple[str, list, str]:
@@ -203,8 +239,16 @@ def make_channel_post(articles: list, heavy: bool, rates: dict) -> tuple[str, li
         log.info("Проверка нашла проблемы, переписываю: %s", problems)
         data = llm.write_channel_post(articles, fix_notes="\n".join(f"- {p}" for p in problems))
         problems = _check_post(data, src_text)
-    data["headline"] = money.annotate(data["headline"], rates)
-    data["paragraphs"] = [money.annotate(p, rates) for p in data["paragraphs"]]   # «≈ $… ≈ … ₽» считает программа
+    data = _polish(data, src_text)
+    plain = "\n".join([data["headline"], *data["paragraphs"]])
+    if verify.check_language(plain):
+        # нейросеть так и не убрала посторонние символы — вырезаем иероглифы сами и просим глянуть глазами
+        data["headline"] = verify.strip_foreign(data["headline"])
+        data["paragraphs"] = [verify.strip_foreign(p) for p in data["paragraphs"]]
+        if not any("посторонние символы" in p or "вьетнамское слово" in p for p in problems):
+            problems.append("в тексте были посторонние символы или слова — проверьте глазами")
+    data["headline"] = money.annotate_all(data["headline"], rates)
+    data["paragraphs"] = [money.annotate_all(p, rates) for p in data["paragraphs"]]   # «≈ $… ≈ … ₽» считает программа
     post = build_channel_post(data)
     if heavy and len(articles) < 2:
         problems.append("тяжёлая тема, а написало об этом только одно издание")

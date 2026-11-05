@@ -103,6 +103,41 @@ def annotate(text: str, rates: dict) -> str:
     return DONG_RX.sub(repl, text)
 
 
+# «312 000 USD», «312 000 долларов», «$312 000», «1,2 млн USD»
+_NUM = r"(\d{1,3}(?:[ \u00a0\u202f]\d{3})+|\d+)(?:[.,](\d+))?"
+USD_RX = re.compile(
+    r"(?:\$\s*" + _NUM + r"(?:\s*(" + _UNIT_RX + r")\.?(?![а-яё\w]))?"
+    r"|(?<![\d.,$])" + _NUM + r"\s*(?:(" + _UNIT_RX + r")\.?\s*)?(?:USD|долл(?:ар(?:ов|а|ы)?)?\.?\s*(?:США)?)(?![а-яё\w]))",
+    re.IGNORECASE,
+)
+
+
+def annotate_usd(text: str, rates: dict) -> str:
+    """Суммы в долларах: единый вид «$312 000» и пересчёт в рубли, если он ещё не стоит рядом."""
+    if not text:
+        return text
+
+    def repl(m: re.Match) -> str:
+        whole, frac, unit = (m.group(1), m.group(2), m.group(3)) if m.group(1) else (m.group(4), m.group(5), m.group(6))
+        whole = re.sub(r"[ \u00a0\u202f]", "", whole)
+        value = float(f"{whole}.{frac}" if frac else whole) * UNITS.get((unit or "").lower().rstrip("."), 1)
+        if value < 1:
+            return m.group(0)
+        out = "$" + (human(value, "$")[1:] if value >= 1e6 else _num(value) if value < 100 else f"{round(value):,}".replace(",", " "))
+        after = text[m.end():m.end() + 6]
+        if rates.get("usd_rub") and "₽" not in after and "≈" not in after:
+            out += f" (≈ {human(value * rates['usd_rub'], '₽')})"
+        return out
+
+    # пересчёт донгов уже даёт «(≈ $… ≈ … ₽)» — его не трогаем
+    parts = re.split(r"(\(≈[^)]*\))", text)
+    return "".join(x if x.startswith("(≈") else USD_RX.sub(repl, x) for x in parts)
+
+
+def annotate_all(text: str, rates: dict) -> str:
+    return annotate_usd(annotate(text, rates), rates)
+
+
 def annotate_brief(data: dict, rates: dict) -> dict:
     data = dict(data)
     for key in ("headline", "summary", "why"):
