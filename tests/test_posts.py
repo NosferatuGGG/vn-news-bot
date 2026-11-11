@@ -296,3 +296,10 @@ def test_redo_marks_old_card_and_rewrites(tmp_path, monkeypatch):
     main._redo_cards(store, TG())
     assert store.get(1)["status"] == "scored" and len(edits) == 1
     assert "Заменено" in edits[0][0][3] and edits[0][1]["buttons"] == []
+
+
+def test_police_not_militia():
+    from bot import verify
+    assert verify.fix_police("Милиция задержала, к настоящему моменту стражи порядка взяли под стражу 21 человека") == \
+        "Полиция задержала, к настоящему моменту полицейские взяли под стражу 21 человека"
+    assert verify.fix_police("двое милиционеров и сотрудник милиции") == "двое полицейских и сотрудник полиции"

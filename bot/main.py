@@ -240,6 +240,8 @@ def make_channel_post(articles: list, heavy: bool, rates: dict) -> tuple[str, li
         data = llm.write_channel_post(articles, fix_notes="\n".join(f"- {p}" for p in problems))
         problems = _check_post(data, src_text)
     data = _polish(data, src_text)
+    data["headline"] = verify.fix_police(data["headline"])
+    data["paragraphs"] = [verify.fix_police(p) for p in data["paragraphs"]]
     plain = "\n".join([data["headline"], *data["paragraphs"]])
     if verify.check_language(plain):
         # нейросеть так и не убрала посторонние символы — вырезаем иероглифы сами и просим глянуть глазами
