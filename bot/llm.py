@@ -288,17 +288,68 @@ def _call_anthropic(model: str, system: str, user: str, name: str, schema: dict,
 
 # max_tokens с запасом: у новых моделей «размышления» тоже считаются в ответ,
 # а платишь всё равно только за реально потраченное
+_backup_cache: list | None = None
+_SKIP_MODEL = re.compile(r"preview|exp|tts|image|live|audio|embed|vision|thinking|latest|computer|robotics|nano|veo|imagen",
+                         re.IGNORECASE)
+
+
+def _version(name: str) -> float:
+    m = re.search(r"gemini-(\d+(?:\.\d+)?)", name)
+    return float(m.group(1)) if m else 0.0
+
+
+def backup_models() -> list:
+    """Запасные модели. При MODEL_BACKUP=auto один раз за запуск спрашиваем у Google список моделей,
+    доступных ключу, и берём текстовые flash-lite / flash / pro, кроме основных: сначала lite, свежие вперёд."""
+    global _backup_cache
+    if CFG.model_backup.strip().lower() != "auto":
+        return [m.strip() for m in CFG.model_backup.split(",") if m.strip()]
+    if _backup_cache is not None:
+        return _backup_cache
+    _backup_cache = []
+    if CFG.llm_provider != "gemini" or not CFG.llm_api_key:
+        return _backup_cache
+    try:
+        names, token = [], ""
+        for _ in range(5):
+            r = _http.get(f"{GEMINI_BASE}/models", headers={"x-goog-api-key": CFG.llm_api_key},
+                          params={"pageSize": 200, **({"pageToken": token} if token else {})}, timeout=20)
+            data = r.json()
+            for m in data.get("models", []):
+                if "generateContent" in (m.get("supportedGenerationMethods") or []):
+                    names.append(m.get("name", "").removeprefix("models/"))
+            token = data.get("nextPageToken") or ""
+            if not token:
+                break
+    except Exception as err:  # noqa: BLE001
+        log.warning("Не получил список моделей Google: %s", err)
+        return _backup_cache
+    main = {CFG.model_fast, CFG.model_writer}
+    good = [n for n in names if re.fullmatch(r"gemini-[\d.]+-(flash-lite|flash|pro)(-\d+)?", n)
+            and not _SKIP_MODEL.search(n) and n not in main]
+    rank = {"flash-lite": 0, "flash": 1, "pro": 2}
+    good.sort(key=lambda n: (rank[re.search(r"flash-lite|flash|pro", n).group(0)], -_version(n)))
+    _backup_cache = good[:4]
+    log.info("Запасные модели Google: %s", ", ".join(_backup_cache) or "нет")
+    return _backup_cache
+
+
 def _call(models, system: str, user: str, name: str, schema: dict, max_tokens: int = 3000) -> dict:
     """models — одна модель или список запасных: если у первой кончился дневной лимит, берём следующую."""
     fn = {"anthropic": _call_anthropic, "gemini": _call_gemini}.get(CFG.llm_provider, _call_openai_compat)
     chain = [models] if isinstance(models, str) else list(models)
     main = set(chain)
-    chain += [m.strip() for m in CFG.model_backup.split(",") if m.strip()]
-    chain = [m for i, m in enumerate(chain) if m and m not in chain[:i]]
     today = quota_day()
+    chain = [m for i, m in enumerate(chain) if m and m not in chain[:i]]
     last_quota = None
     busy = None
-    for model in chain:
+
+    def models_to_try():
+        yield from chain
+        # сюда доходим, только если основные модели перегружены или их лимит кончился
+        yield from (m for m in backup_models() if m not in main)
+
+    for model in models_to_try():
         if EXHAUSTED.get(model) == today:
             continue
         try:

@@ -234,5 +234,26 @@ def test_backup_model_used_when_main_models_are_busy_and_missing_backup_is_skipp
     _mock(monkeypatch, handler, "gemini")
     monkeypatch.setattr(llm, "EXHAUSTED", {})
     monkeypatch.setattr(CFG, "model_backup", "gone-model,old-lite")
+    monkeypatch.setattr(llm, "_backup_cache", None)
     assert llm.score("t", "s", "x", "src", [])["score"] == 10
     assert calls[-1] == "old-lite" and "gone-model" in llm.EXHAUSTED
+
+
+
+def test_auto_backups_come_from_googles_model_list(monkeypatch):
+    def handler(req):
+        assert req.url.path.endswith("/models")
+        return httpx.Response(200, json={"models": [
+            {"name": "models/" + CFG.model_fast, "supportedGenerationMethods": ["generateContent"]},
+            {"name": "models/gemini-3-flash", "supportedGenerationMethods": ["generateContent"]},
+            {"name": "models/gemini-3-flash-lite", "supportedGenerationMethods": ["generateContent"]},
+            {"name": "models/gemini-3.2-flash-lite", "supportedGenerationMethods": ["generateContent"]},
+            {"name": "models/gemini-3.9-flash-preview", "supportedGenerationMethods": ["generateContent"]},
+            {"name": "models/gemini-3-flash-tts", "supportedGenerationMethods": ["generateContent"]},
+            {"name": "models/text-embedding-5", "supportedGenerationMethods": ["embedContent"]},
+        ]})
+
+    _mock(monkeypatch, handler, "gemini")
+    monkeypatch.setattr(CFG, "model_backup", "auto")
+    monkeypatch.setattr(llm, "_backup_cache", None)
+    assert llm.backup_models() == ["gemini-3.2-flash-lite", "gemini-3-flash-lite", "gemini-3-flash"]
