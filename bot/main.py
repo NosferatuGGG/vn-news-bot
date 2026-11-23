@@ -376,6 +376,53 @@ def _redo_cards(store: Store, tg: Telegram | None):
         store.kv_set(key, "1")
 
 
+MANUAL_PATH = os.path.join(os.path.dirname(__file__), "manual_posts.json")
+
+
+def _manual_posts(store: Store, tg: Telegram | None):
+    """Посты, которые редактор (или Claude по его просьбе) написал руками, — в bot/manual_posts.json.
+    Бот присылает каждый один раз карточкой с кнопкой «Опубликовать», а старую карточку той же новости
+    помечает «Заменено» и снимает с неё кнопки."""
+    try:
+        with open(MANUAL_PATH, encoding="utf-8") as f:
+            entries = json.load(f)
+    except FileNotFoundError:
+        return
+    for e in entries:
+        key = f"manual:{e['key']}"
+        if store.kv_get(key) == "1":
+            continue
+        row = store.get(e["id"])
+        if not row or row["status"] in ("posted", "queued", "scheduled"):
+            store.kv_set(key, "1")   # новости уже нет или она уже в канале — не трогаем
+            continue
+        post = build_channel_post({"emoji": e.get("emoji", ""), "headline": e["headline"],
+                                   "paragraphs": e["paragraphs"]})
+        sources = e.get("sources") or [{"source": row["source"], "url": row["url"]}]
+        card = build_post_card(post, row["score"] or 0, row["category"] or "", sources, [],
+                               e.get("note", "переписано вручную"))
+        image = e.get("image") or row["image"] or ""
+        msg_id, kind = 0, "text"
+        if tg and CFG.admin_chat_id and not CFG.dry_run:
+            if row["tg_message_id"]:
+                try:
+                    tg.edit_card(CFG.admin_chat_id, row["tg_message_id"], row["card_kind"] or "text",
+                                 "🔁 <b>Заменено — новая версия ниже</b>\n\n" + (row["card_html"] or row["post_html"] or ""),
+                                 row["image"] or "", buttons=[])
+                except Exception as err:  # noqa: BLE001
+                    log.info("Старую карточку %s не пометил: %s", row["id"], err)
+            msg_id, kind = tg.send_card(CFG.admin_chat_id, card, image, post_buttons(row["id"], "sent"))
+        store.update(row["id"], status="sent", post_html=post, card_html=card, image=image, tg_message_id=msg_id,
+                     card_kind=kind, note=e.get("note", "переписано вручную"))
+        if helper.enabled():
+            try:
+                helper.upload(store.get(row["id"]), post, image, "review", card, kind, msg_id)
+            except helper.HelperError as err:
+                log.warning("Пост не передан помощнику: %s", err)
+        store.kv_set(key, "1")
+        log.info("Прислал пост, написанный вручную: %s", e["headline"])
+
+
 def process(store: Store, tg: Telegram | None, deadline: float | None = None) -> bool:
     """Возвращает False только при настоящем сбое (не при дневном лимите — он обнуляется сам)."""
     if store.kv_get("cards_v2") != "1":
@@ -390,6 +437,7 @@ def process(store: Store, tg: Telegram | None, deadline: float | None = None) ->
                        (time.time() - 30 * 3600,))
         store.kv_set("rescore_v1", "1")
     _redo_cards(store, tg)
+    _manual_posts(store, tg)
     prefilter_queue(store)
     _load_quota_state(store)
     llm.DEADLINE = deadline

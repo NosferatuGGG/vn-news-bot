@@ -303,3 +303,37 @@ def test_police_not_militia():
     assert verify.fix_police("Милиция задержала, к настоящему моменту стражи порядка взяли под стражу 21 человека") == \
         "Полиция задержала, к настоящему моменту полицейские взяли под стражу 21 человека"
     assert verify.fix_police("двое милиционеров и сотрудник милиции") == "двое полицейских и сотрудник полиции"
+
+
+def test_manual_post_replaces_old_card_once(tmp_path, monkeypatch):
+    import json as _json
+    from bot import main
+    from bot.store import Store
+    store = Store(str(tmp_path / "t.db"))
+    store.add_item("u1", "Báo Khánh Hòa", "đuối nước", "", time.time())
+    store.update(1, status="sent", score=7, category="incident", tg_message_id=765, card_kind="photo",
+                 card_html="<b>старая</b>", image="https://x.vn/a.jpg")
+    path = tmp_path / "manual.json"
+    path.write_text(_json.dumps([{"key": "k1", "id": 1, "headline": "Новый заголовок",
+                                  "paragraphs": ["Утром **21 ноября**."]}]), encoding="utf-8")
+    monkeypatch.setattr(main, "MANUAL_PATH", str(path))
+    monkeypatch.setattr(CFG, "dry_run", False)
+    monkeypatch.setattr(CFG, "admin_chat_id", "42")
+    monkeypatch.setattr(main.helper, "enabled", lambda: False)
+    calls = []
+
+    class TG:
+        def edit_card(self, *a, **k):
+            calls.append(("edit", a, k))
+
+        def send_card(self, chat, card, image, buttons, **k):
+            calls.append(("send", card, image, buttons))
+            return 800, "photo"
+
+    main._manual_posts(store, TG())
+    main._manual_posts(store, TG())
+    assert [c[0] for c in calls] == ["edit", "send"]
+    assert "Заменено" in calls[0][1][3] and calls[0][2]["buttons"] == []
+    assert "<b>Новый заголовок</b>" in calls[1][1] and "<b>21 ноября</b>" in calls[1][1]
+    assert calls[1][3][0][0]["callback_data"] == "go:1"
+    assert store.get(1)["tg_message_id"] == 800
