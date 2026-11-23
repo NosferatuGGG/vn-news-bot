@@ -188,7 +188,7 @@ def test_daily_quota_is_not_a_failure(tmp_path, monkeypatch):
     monkeypatch.setattr(tg, "get_updates", lambda offset, timeout: [])
 
     def exhausted(*a, **k):
-        for m in (CFG.model_fast, CFG.model_writer):
+        for m in (CFG.model_fast, CFG.model_writer, *CFG.model_backup.split(",")):
             llm.EXHAUSTED[m] = llm.quota_day()
         raise llm.LLMQuotaError("дневной лимит")
 
@@ -321,3 +321,15 @@ def test_card_with_bad_preview_is_resent_without_picture(monkeypatch):
     monkeypatch.setattr(tg, "_call", fake_call)
     assert tg.send_card("1", "x" * 2000, "https://bad/img.jpg") == (5, "text")
     assert sent[-1] == {"is_disabled": True}
+
+
+def test_long_google_overload_alarms_only_once(tmp_path, monkeypatch):
+    store = Store(str(tmp_path / "t.db"))
+    store.add_item("u1", "Báo Khánh Hòa", "Du khách Nga bị giật túi ở Nha Trang", "", time.time())
+
+    def busy(*a, **k):
+        raise llm.LLMBusyError("503 high demand")
+
+    monkeypatch.setattr(llm, "score_batch", busy)
+    results = [main.process(store, None) for _ in range(6)]
+    assert results == [True, True, False, True, True, True]

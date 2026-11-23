@@ -50,6 +50,9 @@ class Config:
     # быстрая — отбор и проверка фактов, сильная — перевод и рерайт
     model_fast: str = _env("MODEL_FAST", _DEFAULT_MODELS[_PROVIDER][0])
     model_writer: str = _env("MODEL_WRITER", _DEFAULT_MODELS[_PROVIDER][1])
+    # запасные модели: только когда основные перегружены или их дневной лимит кончился;
+    # у каждой свой бесплатный лимит, а старые модели реже бывают перегружены
+    model_backup: str = _env("MODEL_BACKUP", "gemini-2.5-flash-lite,gemini-2.5-flash" if _PROVIDER == "gemini" else "")
 
     # --- Режим работы ---
     # moderate — сначала черновик тебе в личку с кнопками; auto — сразу в канал

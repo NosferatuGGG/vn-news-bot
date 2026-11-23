@@ -291,7 +291,10 @@ def _call_anthropic(model: str, system: str, user: str, name: str, schema: dict,
 def _call(models, system: str, user: str, name: str, schema: dict, max_tokens: int = 3000) -> dict:
     """models — одна модель или список запасных: если у первой кончился дневной лимит, берём следующую."""
     fn = {"anthropic": _call_anthropic, "gemini": _call_gemini}.get(CFG.llm_provider, _call_openai_compat)
-    chain = [models] if isinstance(models, str) else [m for i, m in enumerate(models) if m and m not in models[:i]]
+    chain = [models] if isinstance(models, str) else list(models)
+    main = set(chain)
+    chain += [m.strip() for m in CFG.model_backup.split(",") if m.strip()]
+    chain = [m for i, m in enumerate(chain) if m and m not in chain[:i]]
     today = quota_day()
     last_quota = None
     busy = None
@@ -316,6 +319,13 @@ def _call(models, system: str, user: str, name: str, schema: dict, max_tokens: i
                 raise
             log.warning("У модели %s кончился бесплатный лимит на сегодня", model)
             _annotate("warning", "Дневной лимит", f"{model}: {e}")
+            EXHAUSTED[model] = today
+        except LLMError as e:
+            if model in main:
+                raise
+            # запасной модели может не быть (Google её убрал) или она не справилась — до завтра не трогаем
+            log.warning("Запасная модель %s не подошла: %s", model, str(e)[:200])
+            _annotate("warning", "Запасная модель", f"{model}: {str(e)[:200]}")
             EXHAUSTED[model] = today
     if busy:
         raise busy

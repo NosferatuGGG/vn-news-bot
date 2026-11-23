@@ -217,3 +217,22 @@ def test_broken_json_from_model_is_repaired():
     assert llm._extract_json('{"items": [{"id": id=5, "score": 6, "duplicate_of": 0,}]}')["items"][0]["id"] == 5
     assert llm._extract_json('```json\n{"items": [{"id": 7, "score": 3}\n```')["items"][0]["score"] == 3
     assert llm._as_id("id=42") == 42 and llm._as_id(None) == 0
+
+
+def test_backup_model_used_when_main_models_are_busy_and_missing_backup_is_skipped(monkeypatch):
+    calls = []
+
+    def handler(req):
+        model = json.loads(req.content).get("model", "")
+        calls.append(model)
+        if model in (CFG.model_fast, CFG.model_writer):
+            return httpx.Response(503, json={"error": {"code": 503, "message": "high demand"}})
+        if model == "gone-model":
+            return httpx.Response(404, json={"error": {"code": 404, "message": "model not found"}})
+        return _compat_ok(SCORE)
+
+    _mock(monkeypatch, handler, "gemini")
+    monkeypatch.setattr(llm, "EXHAUSTED", {})
+    monkeypatch.setattr(CFG, "model_backup", "gone-model,old-lite")
+    assert llm.score("t", "s", "x", "src", [])["score"] == 10
+    assert calls[-1] == "old-lite" and "gone-model" in llm.EXHAUSTED

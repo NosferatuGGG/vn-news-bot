@@ -67,7 +67,7 @@ def _load_quota_state(store: Store):
 def _save_quota_state(store: Store, tg: Telegram | None):
     store.kv_set("llm_exhausted", json.dumps(llm.EXHAUSTED))
     today = llm.quota_day()
-    models = {CFG.model_fast, CFG.model_writer}
+    models = {CFG.model_fast, CFG.model_writer, *(m.strip() for m in CFG.model_backup.split(",") if m.strip())}
     if all(llm.EXHAUSTED.get(m) == today for m in models) and store.kv_get("quota_notice") != today:
         store.kv_set("quota_notice", today)
         log.warning("Бесплатный лимит нейросети на сегодня исчерпан")
@@ -447,6 +447,11 @@ def process(store: Store, tg: Telegram | None, deadline: float | None = None) ->
             send_briefs(store, tg, deadline)
         else:
             write_posts(store, tg, deadline)
+        if int(store.kv_get("busy_streak", 0)) >= 3 and tg and CFG.admin_chat_id and not CFG.dry_run:
+            try:
+                tg.call_text(CFG.admin_chat_id, "✅ Google снова отвечает — бот работает дальше.")
+            except Exception:  # noqa: BLE001
+                pass
         store.kv_set("busy_streak", 0)
         return True
     except llm.LLMQuotaError as err:
@@ -458,7 +463,16 @@ def process(store: Store, tg: Telegram | None, deadline: float | None = None) ->
         store.kv_set("busy_streak", streak)
         log.warning("Нейросеть перегружена (%s), попробую в следующий запуск. Подряд: %d", err, streak)
         print(f"::warning title=Нейросеть перегружена::{str(err)[:300]} (подряд: {streak})", flush=True)
-        return streak < 3
+        if streak != 3:
+            return True   # тревога одна на всю перегрузку, а не письмо каждые 20 минут
+        if tg and CFG.admin_chat_id and not CFG.dry_run:
+            try:
+                tg.call_text(CFG.admin_chat_id, "⏳ У Google перегружена нейросеть уже около часа. Бот ничего не "
+                                                "потерял: новости ждут в очереди и придут, когда Google оживёт. "
+                                                "Напишу, когда снова заработает.")
+            except Exception:  # noqa: BLE001
+                pass
+        return False
     except llm.LLMError as err:
         log.error("Нейросеть не ответила: %s", err)
         print(f"::error title=Нейросеть::{str(err)[:900]}", flush=True)
