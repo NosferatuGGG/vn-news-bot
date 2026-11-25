@@ -37,6 +37,7 @@ LAWS = [
     r"quy định mới", r"từ ngày \d", r"có hiệu lực", r"mức phạt", r"phạt tiền", r"cấm",
     r"bằng lái", r"giấy phép lái xe", r"xe máy", r"thuốc lá điện tử", r"vape", r"shisha",
     r"tăng giá", r"giá điện", r"giá xăng", r"tỷ giá", r"mất điện", r"cúp nước",
+    r"ngừng cấp điện", r"cắt điện", r"cúp điện", r"ngừng cấp nước", r"cấm tắm biển", r"tắm biển",
     r"bão", r"áp thấp", r"lũ", r"ngập", r"mưa lớn", r"sạt lở",
     r"sân bay", r"chuyến bay", r"hãng bay", r"Long Thành",
     r"hút thuốc", r"smoking", r"\bbans? (on|at)\b", r"\bbans? \w+ing\b",
