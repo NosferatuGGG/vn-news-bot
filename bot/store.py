@@ -34,7 +34,8 @@ class Store:
         self.db.executescript(SCHEMA)
         # новые колонки для старых баз
         cols = {r[1] for r in self.db.execute("PRAGMA table_info(items)")}
-        for col, kind in (("card_kind", "TEXT"), ("dup_of", "INTEGER"), ("heavy", "INTEGER"), ("card_html", "TEXT")):
+        for col, kind in (("card_kind", "TEXT"), ("dup_of", "INTEGER"), ("heavy", "INTEGER"), ("card_html", "TEXT"),
+                          ("local", "INTEGER DEFAULT 0")):
             if col not in cols:
                 self.db.execute(f"ALTER TABLE items ADD COLUMN {col} {kind}")
         self.db.commit()
@@ -56,6 +57,17 @@ class Store:
                 (url, source, title, summary, published_at, time.time()),
             )
             return cur.rowcount == 1
+
+    def update_by_url(self, url: str, **fields):
+        cols = ", ".join(f"{k}=?" for k in fields)
+        with self.tx() as db:
+            db.execute(f"UPDATE items SET {cols} WHERE url=?", (*fields.values(), url))
+
+    def mark_local(self, url: str):
+        """Новость оказалась в региональном источнике: если её отсеяли за отсутствие места — переразберём."""
+        with self.tx() as db:
+            db.execute("UPDATE items SET local=1, status=CASE WHEN status='filtered' AND note='no-keywords' "
+                       "THEN 'new' ELSE status END WHERE url=? AND (local IS NULL OR local=0)", (url,))
 
     def by_status(self, status: str, limit: int = 100, order: str = "published_at DESC"):
         return self.db.execute(

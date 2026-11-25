@@ -25,6 +25,11 @@ CRIME = [
     r"đuối nước", r"chết đuối", r"sóng", r"sứa", r"cá mập", r"tai nạn", r"cháy", r"nổ",
     r"bắt cóc", r"truy nã", r"bắt giữ", r"khởi tố", r"mại dâm", r"đánh bạc", r"casino",
     r"murder", r"robbery", r"scam", r"arrest", r"drowning",
+    # происшествия, о которых говорит весь город
+    r"va chạm", r"bị thương", r"thương vong", r"nguy kịch", r"cấp cứu", r"nhập viện", r"tông", r"lật",
+    r"rơi từ", r"rơi lầu", r"tầng cao", r"mất tích", r"xô xát", r"côn đồ", r"quấy rối", r"đập phá",
+    r"\bđâm\b", r"cố ý gây thương tích", r"chém", r"say xỉn", r"nồng độ cồn", r"xe điện", r"ô tô điện",
+    r"\bfire\b", r"\bcrash\b", r"\bdies?\b", r"\bdead\b", r"\binjur", r"\bfell\b",
 ]
 
 # Законы и быт, которые касаются каждого
@@ -59,8 +64,9 @@ BORING = re.compile(
 PRIORITY = {"strong": 0, "local": 1, "crime": 2, "laws": 3}
 
 
-def prefilter(title: str, summary: str) -> tuple[bool, str]:
-    """Возвращает (пропустить ли к нейросети, класс новости)."""
+def prefilter(title: str, summary: str, local: bool = False) -> tuple[bool, str]:
+    """Возвращает (пропустить ли к нейросети, класс новости).
+    local — новость из регионального источника: место подразумевается, даже если его нет в заголовке."""
     text = f"{title} {summary}"
     strong = bool(_nga.search(text) or _strong.search(text))
     if BORING.search(title) and not strong:
@@ -68,7 +74,7 @@ def prefilter(title: str, summary: str) -> tuple[bool, str]:
     if strong:
         return True, "strong"
     hot = bool(_crime.search(text) or _laws.search(text))
-    if hot and _places.search(text):
+    if hot and (local or _places.search(text)):
         return True, "local"
     if _crime.search(text):
         return True, "crime"

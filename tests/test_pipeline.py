@@ -69,7 +69,8 @@ def test_full_pipeline(tmp_path, monkeypatch):
         Entry("https://vne.vn/ga", "Ngã ba Trần Phú ùn tắc giờ cao điểm", "", now, "VnExpress"),
         Entry("https://vne.vn/meh", "Trộm xe đạp ở Hà Nội", "", now, "VnExpress"),
     ]
-    monkeypatch.setattr(main, "SOURCES", ["one-source"])
+    from bot.sources import Source
+    monkeypatch.setattr(main, "SOURCES", [Source("Test", "https://example.vn/rss")])
     monkeypatch.setattr(main, "fetch_source", lambda src: entries)
     monkeypatch.setattr(main, "fetch_article", lambda url: Article("Nội dung bài báo " * 40, "https://img/x.jpg", None))
     monkeypatch.setattr(CFG, "max_writes_per_run", 5)
@@ -333,3 +334,26 @@ def test_long_google_overload_alarms_only_once(tmp_path, monkeypatch):
     monkeypatch.setattr(llm, "score_batch", busy)
     results = [main.process(store, None) for _ in range(6)]
     assert results == [True, True, False, True, True, True]
+
+
+def test_local_source_news_passes_without_city_and_new_source_is_seeded(tmp_path, monkeypatch):
+    from bot.fetch import Entry
+    from bot.filters import prefilter
+    from bot.sources import Source
+    assert prefilter("Va chạm với ô tô điện, một phụ nữ bị thương", "", local=True)[0]
+    assert prefilter("Đâm bạn nhậu vì giận chuyện cũ, thanh niên lãnh 9 năm tù", "", local=True)[0]
+    assert not prefilter("Khánh Hòa triển khai chương trình bảo vệ trẻ em trên môi trường mạng", "", local=True)[0]
+
+    store = Store(str(tmp_path / "t.db"))
+    src = Source("VnExpress", "https://vnexpress.net/chu-de/khanh-hoa-2063", kind="html", local=True)
+    batches = [[Entry("https://vnexpress.net/a-1000001.html", "Cháy nhà ở Nha Trang hôm qua", "", time.time(), "VnExpress")],
+               [Entry("https://vnexpress.net/b-1000002.html", "Thanh niên đâm bạn nhậu bị bắt", "", time.time(), "VnExpress")]]
+    monkeypatch.setattr(main, "SOURCES", [src])
+    monkeypatch.setattr(main, "fetch_source", lambda s: batches.pop(0))
+    main.collect(store)
+    main.collect(store)
+    rows = {r["url"]: r for r in store.db.execute("SELECT * FROM items")}
+    assert rows["https://vnexpress.net/a-1000001.html"]["status"] == "filtered"      # первый сбор — старое
+    assert rows["https://vnexpress.net/b-1000002.html"]["local"] == 1
+    main.prefilter_queue(store)
+    assert store.db.execute("SELECT status FROM items WHERE url LIKE '%b-1000002%'").fetchone()[0] == "candidate"

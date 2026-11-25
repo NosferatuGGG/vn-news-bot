@@ -18,6 +18,9 @@ class Source:
     kind: str = "rss"
     link_pattern: str = ""
     verified: bool = False
+    # региональный источник: всё, что там есть, — про Нячанг и Кханьхоа, поэтому новости о криминале
+    # и происшествиях проходят предфильтр, даже если город не назван в заголовке
+    local: bool = False
 
 
 SOURCES: list[Source] = [
@@ -36,13 +39,38 @@ SOURCES: list[Source] = [
         kind="html",
         # только статьи самой рубрики, без ссылок на «женсовет» и политику из боковых колонок
         link_pattern=r"^https://baokhanhhoa\.vn/phap-luat/([a-z0-9\-]+/)?20\d{4}/[a-z0-9\-]+/?$",
-        verified=True,
+        verified=True, local=True,
     ),
     Source(
         "Báo Khánh Hòa",
         "https://baokhanhhoa.vn/xa-hoi/",
         kind="html",
         link_pattern=r"^https://baokhanhhoa\.vn/xa-hoi/([a-z0-9\-]+/)?20\d{4}/[a-z0-9\-]+/?$",
+        local=True,
+    ),
+
+    # --- Всё про Кханьхоа у крупных изданий (страницы-темы) ---
+    Source(
+        "VnExpress",
+        "https://vnexpress.net/chu-de/khanh-hoa-2063",
+        kind="html",
+        link_pattern=r"^https://vnexpress\.net/[a-z0-9\-]+-\d{7}\.html$",
+        verified=True, local=True,
+    ),
+    # Báo Mới собирает статьи сотен изданий; тема «Кханьхоа» — всё, что пишут о провинции
+    Source(
+        "Báo Mới",
+        "https://baomoi.com/khanh-hoa-tag1006.epi",
+        kind="html",
+        link_pattern=r"^https://baomoi\.com/[a-z0-9\-]+-c\d+\.epi$",
+        verified=True, local=True,
+    ),
+    Source(
+        "VnExpress International",
+        "https://e.vnexpress.net/nha-trang/tag-1274224-1.html",
+        kind="html",
+        link_pattern=r"^https://e\.vnexpress\.net/news/[a-z0-9\-/]+-\d{7}\.html$",
+        local=True,
     ),
 
     # --- Англоязычная версия VnExpress: хорошо ловит истории про иностранцев ---

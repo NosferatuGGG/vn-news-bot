@@ -104,8 +104,25 @@ def clean_image_url(src: str, page_url: str) -> str:
     return src if re.match(r"^https?://[^\s/]+\.[^\s/]+/", src) else ""
 
 
+def _resolve_baomoi(url: str) -> tuple[str, str]:
+    """Báo Mới показывает текст скриптом, а в HTML его нет. Ссылка вида …-r123.epi ведёт на статью
+    в исходном издании — берём текст оттуда. Возвращает (html, адрес, откуда взят текст)."""
+    m = re.search(r"-c(\d+)\.epi$", url)
+    if m:
+        try:
+            r = _client.get(url[: m.start()] + f"-r{m.group(1)}.epi")
+            if r.status_code < 400 and "baomoi.com" not in str(r.url):
+                return r.text, str(r.url)
+        except Exception as err:  # noqa: BLE001
+            log.info("Báo Mới: исходная статья не открылась (%s)", err)
+    return get(url), url
+
+
 def fetch_article(url: str) -> Article:
-    html = get(url)
+    if "baomoi.com/" in url:
+        html, url = _resolve_baomoi(url)
+    else:
+        html = get(url)
     text = trafilatura.extract(html, include_comments=False, include_tables=False) or ""
     soup = BeautifulSoup(html, "html.parser")
     img = ""

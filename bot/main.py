@@ -31,13 +31,31 @@ log = logging.getLogger("bot")
 def collect(store: Store) -> int:
     new = 0
     cutoff = time.time() - CFG.max_age_hours * 3600
+    counts = []
     for src in SOURCES:
-        for e in fetch_source(src):
+        entries = fetch_source(src)
+        counts.append(f"{src.name} {src.url.split('/', 3)[-1][:40]}: {len(entries)}")
+        # новый источник: на странице-рубрике много старого, а даты там нет — при первом сборе
+        # всё увиденное помечаем как старое, чтобы не завалить тебя карточками недельной давности
+        seeding = src.kind == "html" and store.kv_get(f"seeded:{src.url}") is None
+        for e in entries:
             if e.published_at < cutoff:
                 continue
             if store.add_item(e.url, e.source, e.title, e.summary, e.published_at):
                 new += 1
-    log.info("Собрано новых заголовков: %d", new)
+                if seeding:
+                    store.update_by_url(e.url, status="filtered", note="старое при подключении источника")
+                elif src.local:
+                    store.update_by_url(e.url, local=1)
+            elif src.local:
+                # эту новость уже видели в общей ленте и отсеяли без ключевых слов — теперь ясно, что она местная
+                store.mark_local(e.url)
+        if seeding and entries:
+            store.kv_set(f"seeded:{src.url}", "1")
+    empty = [c for c in counts if c.endswith(": 0")]
+    if empty:
+        print(f"::warning title=Источники без новостей::{'; '.join(empty)}", flush=True)
+    log.info("Собрано новых заголовков: %d (%s)", new, "; ".join(counts))
     return new
 
 
@@ -86,7 +104,7 @@ def prefilter_queue(store: Store):
     чтобы правки фильтра сразу действовали и на очередь."""
     cutoff = time.time() - CFG.max_age_hours * 3600
     for row in list(store.by_status("new", limit=2000)) + list(store.by_status("candidate", limit=2000)):
-        ok, why = prefilter(row["title"], row["summary"] or "")
+        ok, why = prefilter(row["title"], row["summary"] or "", bool(row["local"]))
         if ok and row["published_at"] < cutoff:
             ok, why = False, "old"
         store.update(row["id"], status="candidate" if ok else "filtered", note=why)
